@@ -1,0 +1,57 @@
+{
+	"name": "@inv1x/pi-subagents",
+	"version": "0.5.0",
+	"description": "Focused subagents and durable programmatic workflows for Pi",
+	"type": "module",
+	"license": "MIT",
+	"keywords": [
+		"pi-package",
+		"pi-coding-agent",
+		"subagents",
+		"workflows",
+		"orchestration"
+	],
+	"files": [
+		"src",
+		"agents",
+		"workflows",
+		"README.md",
+		"PLAN.md",
+		"LICENSE"
+	],
+	"exports": {
+		".": "./src/index.ts",
+		"./workflow": "./src/workflow-api.ts"
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"dependencies": {
+		"jiti": "^2.7.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"scripts": {
+		"check": "biome check .",
+		"check:fix": "biome check --write .",
+		"typecheck": "tsc --noEmit",
+		"test": "node --import jiti/register --test test/*.test.ts"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.5",
+		"@earendil-works/pi-agent-core": "^0.81.1",
+		"@earendil-works/pi-ai": "^0.81.1",
+		"@earendil-works/pi-coding-agent": "^0.81.1",
+		"@earendil-works/pi-tui": "^0.81.1",
+		"@types/node": "^26.1.1",
+		"typebox": "^1.3.6",
+		"typescript": "^7.0.2"
+	}
+}
