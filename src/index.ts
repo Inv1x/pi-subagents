@@ -19,6 +19,7 @@ import type {
 } from "./types.ts";
 import { TERMINAL_STATES } from "./types.ts";
 import {
+	closeFleet,
 	installUiProjection,
 	openFleet,
 	renderControlCall,
@@ -43,6 +44,13 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	description:
 		"Agent discovery scope. Defaults to both for trusted projects and user otherwise.",
 });
+const STATUS_ACTIVATION_EVENT = "pi-ui-customization:activate-status";
+const STATUS_KEY = "pi-subagents";
+
+type StatusActivation = {
+	key?: unknown;
+	sessionId?: unknown;
+};
 
 const SubagentRunParams = Type.Object({
 	agent: Type.String({
@@ -356,16 +364,42 @@ export default function (pi: ExtensionAPI) {
 	const workflowEngine = getWorkflowEngine(runtime);
 	const observedRuns = new Set<string>();
 	let uninstallUi: (() => void) | undefined;
+	let uninstallStatusActivation: (() => void) | undefined;
+	let uiSessionId: string | undefined;
 
 	pi.on("session_start", (_event, ctx) => {
+		if (uiSessionId) closeFleet(runtime, uiSessionId);
+		uiSessionId = ctx.sessionManager.getSessionId();
 		runtime.configure(loadConfig(ctx.cwd, ctx.isProjectTrusted()));
 		uninstallUi?.();
 		uninstallUi = installUiProjection(ctx, runtime, observedRuns);
+		uninstallStatusActivation?.();
+		uninstallStatusActivation = pi.events.on(
+			STATUS_ACTIVATION_EVENT,
+			(data) => {
+				const activation = data as StatusActivation;
+				if (
+					activation.key !== STATUS_KEY ||
+					activation.sessionId !== ctx.sessionManager.getSessionId()
+				)
+					return;
+				void openFleet(ctx, runtime).catch((error) =>
+					ctx.ui.notify(
+						error instanceof Error ? error.message : String(error),
+						"error",
+					),
+				);
+			},
+		);
 	});
 
 	pi.on("session_shutdown", (event) => {
+		if (uiSessionId) closeFleet(runtime, uiSessionId);
+		uiSessionId = undefined;
 		uninstallUi?.();
 		uninstallUi = undefined;
+		uninstallStatusActivation?.();
+		uninstallStatusActivation = undefined;
 		if (event.reason === "quit") runtime.shutdown();
 	});
 

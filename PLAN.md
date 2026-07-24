@@ -491,7 +491,7 @@ The shipped 0.5.0 UI intentionally avoids an above-editor widget. Active and rec
 2 agents running · 1 workflow needs input · $0.41 · /subagents-fleet
 ```
 
-Keep it compact, session-scoped, and remove it when no run is relevant to the current session. The status does not intercept arrows or Enter; `/subagents-fleet` opens the fleet inspector without conflicting with selectors and other overlays.
+Keep it compact, session-scoped, and remove it when no run is relevant to the current session. When `pi-ui-customization` is loaded and the main editor is empty, its editor-scoped navigation uses Up/Down to select the status and Enter to open `/subagents-fleet`; selectors and overlays retain their own input ownership.
 
 ### 8.4 Fleet overlay
 

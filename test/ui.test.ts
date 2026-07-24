@@ -1,14 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type {
-	ExtensionContext,
-	KeybindingsManager,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Component, OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import { formatCount } from "../src/format.ts";
 import type { SubagentRuntime } from "../src/runtime.ts";
 import type { RunRecord, RunUpdate } from "../src/types.ts";
 import {
+	closeFleet,
 	installUiProjection,
 	openFleet,
 	renderControlResult,
@@ -20,16 +18,6 @@ const theme = {
 	inverse: (text: string) => `[inverse]${text}[/inverse]`,
 	bold: (text: string) => text,
 } as ExtensionContext["ui"]["theme"];
-
-const keybindings = {
-	matches: (data: string, binding: string) => {
-		if (binding === "tui.select.up") return data === "\u001b[A";
-		if (binding === "tui.select.down") return data === "\u001b[B";
-		if (binding === "tui.select.cancel")
-			return data === "\u001b" || data === "\u0003";
-		return false;
-	},
-} as unknown as KeybindingsManager;
 
 function run(patch: Partial<RunRecord> = {}): RunRecord {
 	const now = Date.now();
@@ -238,7 +226,53 @@ test("fleet overlay takes initial focus without stealing it back", async () => {
 	uninstall();
 });
 
-test("fleet arrows select inverted rows while scoped events stay in the overlay", async () => {
+test("fleet lifecycle close disposes the overlay and allows reopening", async () => {
+	const active = run();
+	const runtime = {
+		listForSession: () => [active],
+	} as unknown as SubagentRuntime;
+	const tui = {
+		terminal: { rows: 30 },
+		requestRender: () => {},
+	} as unknown as TUI;
+	let mounts = 0;
+	const ctx = {
+		mode: "tui",
+		sessionManager: { getSessionId: () => "session-a" },
+		ui: {
+			theme,
+			custom: (
+				factory: (
+					tui: TUI,
+					theme: ExtensionContext["ui"]["theme"],
+					keys: unknown,
+					done: () => void,
+				) => Component,
+			) =>
+				new Promise<undefined>((resolve) => {
+					let component: (Component & { dispose?: () => void }) | undefined;
+					const done = () => {
+						component?.dispose?.();
+						resolve(undefined);
+					};
+					component = factory(tui, theme, {}, done);
+					mounts++;
+				}),
+		},
+	} as unknown as ExtensionContext;
+
+	const first = openFleet(ctx, runtime);
+	closeFleet(runtime, "session-a");
+	await first;
+	assert.equal(mounts, 1);
+
+	const second = openFleet(ctx, runtime);
+	closeFleet(runtime, "session-a");
+	await second;
+	assert.equal(mounts, 2);
+});
+
+test("fleet arrows select agents while j/k exclusively scroll output", async () => {
 	const alpha = run({
 		id: "agent_alpha",
 		agent: "alpha",
@@ -254,24 +288,14 @@ test("fleet arrows select inverted rows while scoped events stay in the overlay"
 			"\n",
 		),
 	});
-	let listener: ((update: RunUpdate) => void) | undefined;
 	const runtime = {
 		listForSession: () => [alpha, beta],
-		subscribe: (next: (update: RunUpdate) => void) => {
-			listener = next;
-			return () => {
-				listener = undefined;
-			};
-		},
 		background: (id: string) => (id === alpha.id ? alpha : beta),
 	} as unknown as SubagentRuntime;
 	let component: Component | undefined;
-	let renderRequests = 0;
 	const tui = {
 		terminal: { rows: 30 },
-		requestRender: () => {
-			renderRequests++;
-		},
+		requestRender: () => {},
 	} as unknown as TUI;
 	const handle = {
 		hide: () => {},
@@ -290,12 +314,12 @@ test("fleet arrows select inverted rows while scoped events stay in the overlay"
 				factory: (
 					tui: TUI,
 					theme: ExtensionContext["ui"]["theme"],
-					keys: KeybindingsManager,
+					keys: unknown,
 					done: () => void,
 				) => Component,
 				options: { onHandle?: (overlayHandle: OverlayHandle) => void },
 			) => {
-				component = factory(tui, theme, keybindings, () => {});
+				component = factory(tui, theme, {}, () => {});
 				options.onHandle?.(handle);
 				return undefined;
 			},
@@ -304,32 +328,12 @@ test("fleet arrows select inverted rows while scoped events stay in the overlay"
 
 	await openFleet(ctx, runtime);
 	const render = () => component?.render(120).join("\n") ?? "";
-	const selectedRow = () =>
-		render()
-			.split("\n")
-			.find((line) => line.includes("[inverse]")) ?? "";
 	assert.match(render(), /alpha · agent/);
-	assert.match(selectedRow(), /alpha/);
-	assert.doesNotMatch(selectedRow(), /beta/);
 	assert.match(render(), /↑↓ select · g\/G first\/last · j\/k scroll output/);
 	assert.doesNotMatch(render(), /PgUp|PgDn/);
 
-	const requestsBeforeForeignUpdate = renderRequests;
-	listener?.({
-		run: run({ id: "agent_foreign", sessionId: "session-b" }),
-		previousState: "queued",
-	});
-	assert.equal(renderRequests, requestsBeforeForeignUpdate);
-	listener?.({ run: { ...alpha }, previousState: "queued" });
-	assert.equal(renderRequests, requestsBeforeForeignUpdate + 1);
-
 	component?.handleInput?.("\u001b[B");
 	assert.match(render(), /beta · agent/);
-	assert.match(selectedRow(), /beta/);
-	component?.handleInput?.("\u001b[B");
-	assert.match(selectedRow(), /alpha/, "Down wraps to the first run");
-	component?.handleInput?.("\u001b[A");
-	assert.match(selectedRow(), /beta/, "Up wraps to the last run");
 	component?.handleInput?.("j");
 	assert.doesNotMatch(render(), /Run\s+agent_beta/);
 	assert.match(render(), /Kind\s+agent/);
@@ -347,7 +351,6 @@ test("fleet arrows select inverted rows while scoped events stay in the overlay"
 	(
 		component as (Component & { dispose?: () => void }) | undefined
 	)?.dispose?.();
-	assert.equal(listener, undefined, "overlay events unregister on dispose");
 });
 
 test("footer does not intercept navigation while Ctrl+B backgrounds a run", () => {

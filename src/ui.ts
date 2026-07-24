@@ -1,7 +1,4 @@
-import type {
-	ExtensionContext,
-	KeybindingsManager,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import {
 	type Component,
@@ -298,6 +295,7 @@ const RECENT_RUN_WINDOW_MS = 5 * 60_000;
 
 type FleetOverlayState = {
 	handle?: OverlayHandle;
+	close?: () => void;
 };
 
 const fleetOverlayStates = new WeakMap<
@@ -333,6 +331,10 @@ function endFleetOverlay(
 	if (states?.get(sessionId) !== state) return;
 	states.delete(sessionId);
 	if (!states.size) fleetOverlayStates.delete(runtime);
+}
+
+export function closeFleet(runtime: SubagentRuntime, sessionId: string): void {
+	getFleetOverlayState(runtime, sessionId)?.close?.();
 }
 
 function isInspectableRun(run: RunRecord, now = Date.now()): boolean {
@@ -576,23 +578,16 @@ class FleetComponent implements Component {
 	private outputScroll = 0;
 	private runs: RunRecord[] = [];
 	private timer: ReturnType<typeof setInterval>;
-	private unsubscribe: () => void;
 	private disposed = false;
 
 	constructor(
 		private readonly tui: TUI,
 		private readonly theme: ExtensionContext["ui"]["theme"],
-		private readonly keybindings: KeybindingsManager,
 		private readonly runtime: SubagentRuntime,
 		private readonly sessionId: string,
 		private readonly done: () => void,
 	) {
 		this.refresh();
-		this.unsubscribe = this.runtime.subscribe((update) => {
-			if (this.disposed || update.run.sessionId !== this.sessionId) return;
-			this.refresh();
-			this.tui.requestRender();
-		});
 		this.timer = setInterval(() => {
 			if (!this.disposed) {
 				this.refresh();
@@ -624,20 +619,24 @@ class FleetComponent implements Component {
 	}
 
 	handleInput(data: string): void {
-		if (this.keybindings.matches(data, "tui.select.cancel") || data === "q") {
+		if (
+			matchesKey(data, "escape") ||
+			matchesKey(data, "ctrl+c") ||
+			data === "q"
+		) {
 			this.done();
 			return;
 		}
-		if (this.keybindings.matches(data, "tui.select.up")) {
+		if (matchesKey(data, "up")) {
 			const previous = this.selected;
-			if (this.runs.length)
-				this.selected =
-					(this.selected - 1 + this.runs.length) % this.runs.length;
+			this.selected = Math.max(0, this.selected - 1);
 			if (this.selected !== previous) this.outputScroll = 0;
-		} else if (this.keybindings.matches(data, "tui.select.down")) {
+		} else if (matchesKey(data, "down")) {
 			const previous = this.selected;
-			if (this.runs.length)
-				this.selected = (this.selected + 1) % this.runs.length;
+			this.selected = Math.min(
+				Math.max(0, this.runs.length - 1),
+				this.selected + 1,
+			);
 			if (this.selected !== previous) this.outputScroll = 0;
 		} else if (data === "g") {
 			this.selected = 0;
@@ -708,12 +707,7 @@ class FleetComponent implements Component {
 					? this.theme.fg("accent", rawName)
 					: this.theme.fg("text", rawName);
 				const left = `${marker}${nested}${square} ${name}`;
-				const row = splitColumns(
-					left,
-					this.theme.fg("dim", run.state),
-					leftInner,
-				);
-				return selected ? this.theme.inverse(row) : row;
+				return splitColumns(left, this.theme.fg("dim", run.state), leftInner);
 			});
 		const run = this.runs[this.selected];
 		const children = run
@@ -793,10 +787,8 @@ class FleetComponent implements Component {
 		this.refresh();
 	}
 	dispose(): void {
-		if (this.disposed) return;
 		this.disposed = true;
 		clearInterval(this.timer);
-		this.unsubscribe();
 	}
 }
 
@@ -821,11 +813,18 @@ export async function openFleet(
 	if (!state) return;
 	try {
 		await ctx.ui.custom<undefined>(
-			(tui, theme, keybindings, done) =>
-				new FleetComponent(tui, theme, keybindings, runtime, sessionId, () => {
+			(tui, theme, _keys, done) => {
+				let closed = false;
+				const close = () => {
+					if (closed) return;
+					closed = true;
+					state.close = undefined;
 					endFleetOverlay(runtime, sessionId, state);
 					done(undefined);
-				}),
+				};
+				state.close = close;
+				return new FleetComponent(tui, theme, runtime, sessionId, close);
+			},
 			{
 				overlay: true,
 				overlayOptions: {
@@ -842,6 +841,7 @@ export async function openFleet(
 			},
 		);
 	} finally {
+		state.close = undefined;
 		endFleetOverlay(runtime, sessionId, state);
 	}
 }
