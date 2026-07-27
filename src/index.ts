@@ -11,7 +11,7 @@ import { loadConfig } from "./config.ts";
 import { THINKING_LEVELS } from "./model-options.ts";
 import { openAgentModelSettings } from "./model-settings.ts";
 import { resolveAgentModelRoute } from "./routing.ts";
-import { getRuntime } from "./runtime.ts";
+import { getRuntime, type SubagentRuntime } from "./runtime.ts";
 import type {
 	AgentDefinition,
 	ContextMode,
@@ -45,6 +45,7 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 const STATUS_ACTIVATION_EVENT = "pi-ui-customization:activate-status";
 const STATUS_OPTIONS_EVENT = "pi-ui-customization:status-options";
 const STATUS_KEY = "pi-subagents";
+const BACKGROUND_COMPLETION_MESSAGE = "pi-subagents-completion";
 
 type StatusActivation = {
 	key?: unknown;
@@ -402,6 +403,78 @@ function formatWaitResult(record: RunRecord): string {
 	return `Wait window ended; ${record.agent ?? record.workflow ?? record.kind} is still ${record.state} [${record.id}] and continues in the background. Use status or wait again only when its result is needed.`;
 }
 
+function formatBackgroundCompletion(record: RunRecord): string {
+	const kind = record.kind === "workflow" ? "workflow" : "subagent";
+	const name = record.agent ?? record.workflow ?? record.kind;
+	const result = record.output ?? record.error?.message ?? "(no output)";
+	return `Background ${kind} ${name} ${record.state} [${record.id}].\n\n${result}`;
+}
+
+export function sendBackgroundCompletion(
+	pi: Pick<ExtensionAPI, "sendMessage">,
+	record: RunRecord,
+): void {
+	pi.sendMessage(
+		{
+			customType: BACKGROUND_COMPLETION_MESSAGE,
+			content: formatBackgroundCompletion(record),
+			display: true,
+			details: { run: record },
+		},
+		{ deliverAs: "followUp", triggerTurn: true },
+	);
+}
+
+function completionKey(runId: string, generation: unknown): string {
+	return `${runId}:${Number(generation ?? 1)}`;
+}
+
+export function reconcileBackgroundCompletions(
+	ctx: ExtensionContext,
+	runtime: SubagentRuntime,
+): void {
+	const persisted = new Set<string>();
+	for (const entry of ctx.sessionManager.getBranch()) {
+		const message = entry as unknown as {
+			type?: unknown;
+			customType?: unknown;
+			details?: {
+				run?: { id?: unknown; metadata?: { completionGeneration?: unknown } };
+			};
+		};
+		if (
+			message.type === "custom_message" &&
+			message.customType === BACKGROUND_COMPLETION_MESSAGE &&
+			typeof message.details?.run?.id === "string"
+		)
+			persisted.add(
+				completionKey(
+					message.details.run.id,
+					message.details.run.metadata?.completionGeneration,
+				),
+			);
+	}
+	const sessionId = ctx.sessionManager.getSessionId();
+	for (const run of runtime.listForSession(
+		sessionId,
+		Number.MAX_SAFE_INTEGER,
+	)) {
+		if (
+			!run.background ||
+			!TERMINAL_STATES.has(run.state) ||
+			run.metadata?.completionPending !== true ||
+			run.metadata?.completionDeliveredAt
+		)
+			continue;
+		if (
+			persisted.has(completionKey(run.id, run.metadata?.completionGeneration))
+		)
+			runtime.markCompletionDelivered(run.id, sessionId);
+		else if (run.metadata?.completionEnqueuedAt)
+			runtime.clearCompletionEnqueued(run.id, sessionId);
+	}
+}
+
 function requireRunId(value: string | undefined, action: string): string {
 	if (!value) throw new Error(`${action} requires runId.`);
 	return value;
@@ -410,7 +483,15 @@ function requireRunId(value: string | undefined, action: string): string {
 export default function (pi: ExtensionAPI) {
 	const runtime = getRuntime();
 	const workflowEngine = getWorkflowEngine(runtime);
-	const observedRuns = new Set<string>();
+	const observedRuns = new Map<string, number>();
+	const observeRun = (runId: string) => {
+		observedRuns.set(runId, (observedRuns.get(runId) ?? 0) + 1);
+		return () => {
+			const remaining = (observedRuns.get(runId) ?? 1) - 1;
+			if (remaining > 0) observedRuns.set(runId, remaining);
+			else observedRuns.delete(runId);
+		};
+	};
 	let uninstallUi: (() => void) | undefined;
 	let uninstallStatusActivation: (() => void) | undefined;
 	let uiSessionId: string | undefined;
@@ -424,7 +505,11 @@ export default function (pi: ExtensionAPI) {
 		uiSessionId = ctx.sessionManager.getSessionId();
 		runtime.configure(loadConfig(ctx.cwd, ctx.isProjectTrusted()));
 		uninstallUi?.();
-		uninstallUi = installUiProjection(ctx, runtime, observedRuns);
+		uninstallUi = undefined;
+		reconcileBackgroundCompletions(ctx, runtime);
+		uninstallUi = installUiProjection(ctx, runtime, observedRuns, (run) =>
+			sendBackgroundCompletion(pi, run),
+		);
 		uninstallStatusActivation?.();
 		uninstallStatusActivation = pi.events.on(
 			STATUS_ACTIVATION_EVENT,
@@ -445,17 +530,19 @@ export default function (pi: ExtensionAPI) {
 		);
 	});
 
-	pi.on("session_shutdown", (event) => {
+	pi.on("session_shutdown", (event, ctx) => {
 		if (uiSessionId) closeFleet(runtime, uiSessionId);
 		uiSessionId = undefined;
 		uninstallUi?.();
 		uninstallUi = undefined;
 		uninstallStatusActivation?.();
 		uninstallStatusActivation = undefined;
+		reconcileBackgroundCompletions(ctx, runtime);
 		if (event.reason === "quit") runtime.shutdown();
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
+		reconcileBackgroundCompletions(ctx, runtime);
 		if (!pi.getActiveTools().includes("subagent_run")) return;
 		const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
 		const scope = ctx.isProjectTrusted() ? "both" : "user";
@@ -645,7 +732,7 @@ export default function (pi: ExtensionAPI) {
 			if (params.action === "wait") {
 				const pending = runtime.getForSession(id, sessionId);
 				if (pending?.kind !== "agent") throw new Error(`Run not found: ${id}`);
-				observedRuns.add(pending.id);
+				const releaseObservation = observeRun(pending.id);
 				try {
 					const run = await runtime.wait(pending.id, params.timeoutMs, signal);
 					return {
@@ -653,7 +740,7 @@ export default function (pi: ExtensionAPI) {
 						details: { runs: [run] },
 					};
 				} finally {
-					observedRuns.delete(pending.id);
+					releaseObservation();
 				}
 			}
 			const pending = runtime.getForSession(id, sessionId);
@@ -858,7 +945,7 @@ export default function (pi: ExtensionAPI) {
 				const pending = runtime.getForSession(id, sessionId);
 				if (pending?.kind !== "workflow")
 					throw new Error(`Workflow run not found: ${id}`);
-				observedRuns.add(pending.id);
+				const releaseObservation = observeRun(pending.id);
 				try {
 					const run = await workflowEngine.wait(
 						pending.id,
@@ -870,7 +957,7 @@ export default function (pi: ExtensionAPI) {
 						details: { runs: [run] },
 					};
 				} finally {
-					observedRuns.delete(pending.id);
+					releaseObservation();
 				}
 			}
 			if (params.action === "stop") {

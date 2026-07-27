@@ -164,7 +164,7 @@ test("count formatting handles singular and plural nouns", () => {
 });
 
 test("active fleet uses one session-scoped footer status and no widget", () => {
-	const active = run();
+	const active = run({ metadata: { completionPending: true } });
 	const otherSession = run({
 		id: "agent_other_session",
 		sessionId: "session-b",
@@ -179,6 +179,13 @@ test("active fleet uses one session-scoped footer status and no widget", () => {
 		listForSession: (sessionId: string) =>
 			[active, otherSession].filter((record) => record.sessionId === sessionId),
 		getConfig: () => ({ showStatus: true }),
+		markCompletionDelivered: () => {
+			active.metadata = {
+				...active.metadata,
+				completionDeliveredAt: Date.now(),
+			};
+			return active;
+		},
 		subscribe: (next: (update: RunUpdate) => void) => {
 			listener = next;
 			return () => {
@@ -199,7 +206,13 @@ test("active fleet uses one session-scoped footer status and no widget", () => {
 	} as unknown as ExtensionContext;
 
 	const observedRuns = new Set([active.id]);
-	const uninstall = installUiProjection(ctx, runtime, observedRuns);
+	const completions: string[] = [];
+	const uninstall = installUiProjection(
+		ctx,
+		runtime,
+		observedRuns,
+		(completed) => completions.push(completed.id),
+	);
 	assert.equal(statuses[0], "1 agent running · $0.09 · /subagents-fleet");
 	assert.doesNotMatch(statuses[0] ?? "", /other-project-agent|10\.09/);
 	assert.equal(widgets[0], undefined);
@@ -213,7 +226,179 @@ test("active fleet uses one session-scoped footer status and no widget", () => {
 		[],
 		"completion toast is redundant while a wait call is rendering the result",
 	);
+	assert.deepEqual(
+		completions,
+		[],
+		"completion message is redundant while a wait call returns the result",
+	);
 	uninstall();
+});
+
+test("every backgrounded top-level run emits one parent completion", () => {
+	const agent = run({
+		id: "agent_background",
+		metadata: { completionPending: true },
+	});
+	const workflow = run({
+		id: "workflow_background",
+		kind: "workflow",
+		agent: undefined,
+		workflow: "parallel-review",
+		metadata: { completionPending: true },
+	});
+	const foreground = run({ id: "agent_foreground", background: false });
+	const child = run({
+		id: "agent_workflow_child",
+		background: false,
+		parentRunId: workflow.id,
+	});
+	const records = [agent, workflow, foreground, child];
+	let listener: ((update: RunUpdate) => void) | undefined;
+	const notifications: string[] = [];
+	const completions: string[] = [];
+	const runtime = {
+		listForSession: () => records,
+		getConfig: () => ({ showStatus: true }),
+		markCompletionDelivered: (id: string) => {
+			const completed = records.find((record) => record.id === id);
+			assert.ok(completed);
+			completed.metadata = {
+				...completed.metadata,
+				completionDeliveredAt: Date.now(),
+			};
+			return completed;
+		},
+		markCompletionEnqueued: (id: string) => {
+			const completed = records.find((record) => record.id === id);
+			assert.ok(completed);
+			completed.metadata = {
+				...completed.metadata,
+				completionEnqueuedAt: Date.now(),
+			};
+			return completed;
+		},
+		subscribe: (next: (update: RunUpdate) => void) => {
+			listener = next;
+			return () => {
+				listener = undefined;
+			};
+		},
+	} as unknown as SubagentRuntime;
+	const ctx = {
+		mode: "json",
+		sessionManager: { getSessionId: () => "session-a" },
+		ui: {
+			theme,
+			setStatus: () => {},
+			setWidget: () => {},
+			notify: (message: string) => notifications.push(message),
+		},
+	} as unknown as ExtensionContext;
+
+	const uninstall = installUiProjection(ctx, runtime, new Set(), (completed) =>
+		completions.push(completed.id),
+	);
+	for (const completed of records) {
+		completed.state = "succeeded";
+		completed.endedAt = Date.now();
+		listener?.({ run: { ...completed }, previousState: "running" });
+	}
+	listener?.({ run: { ...agent }, previousState: "running" });
+
+	assert.deepEqual(completions, [agent.id, workflow.id]);
+	assert.deepEqual(notifications, [
+		"scout succeeded",
+		"parallel-review succeeded",
+	]);
+	uninstall();
+});
+
+test("an inactive owner session queues on return and retries a lost queue", () => {
+	const completed = run({
+		id: "agent_inactive_session",
+		state: "succeeded",
+		endedAt: Date.now(),
+		metadata: { completionPending: true },
+	});
+	let listener: ((update: RunUpdate) => void) | undefined;
+	const runtime = {
+		listForSession: (sessionId: string) =>
+			completed.sessionId === sessionId ? [completed] : [],
+		getConfig: () => ({ showStatus: true }),
+		markCompletionDelivered: () => {
+			completed.metadata = {
+				...completed.metadata,
+				completionEnqueuedAt: undefined,
+				completionDeliveredAt: Date.now(),
+			};
+			return completed;
+		},
+		markCompletionEnqueued: () => {
+			completed.metadata = {
+				...completed.metadata,
+				completionEnqueuedAt: Date.now(),
+			};
+			return completed;
+		},
+		subscribe: (next: (update: RunUpdate) => void) => {
+			listener = next;
+			return () => {
+				listener = undefined;
+			};
+		},
+	} as unknown as SubagentRuntime;
+	const context = (sessionId: string) =>
+		({
+			mode: "json",
+			sessionManager: { getSessionId: () => sessionId },
+			ui: {
+				theme,
+				setStatus: () => {},
+				setWidget: () => {},
+				notify: () => {},
+			},
+		}) as unknown as ExtensionContext;
+	const completions: string[] = [];
+	const receive = (record: RunRecord) => completions.push(record.id);
+
+	const leaveInactive = installUiProjection(
+		context("session-b"),
+		runtime,
+		new Set(),
+		receive,
+	);
+	listener?.({ run: { ...completed }, previousState: "running" });
+	assert.deepEqual(completions, []);
+	assert.equal(completed.metadata?.completionDeliveredAt, undefined);
+	leaveInactive();
+
+	const returnToOwner = installUiProjection(
+		context("session-a"),
+		runtime,
+		new Set(),
+		receive,
+	);
+	assert.deepEqual(completions, [completed.id]);
+	assert.equal(typeof completed.metadata?.completionEnqueuedAt, "number");
+	assert.equal(completed.metadata?.completionDeliveredAt, undefined);
+
+	completed.metadata = {
+		...completed.metadata,
+		completionEnqueuedAt: undefined,
+	};
+	listener?.({ run: { ...completed }, previousState: "succeeded" });
+	assert.deepEqual(completions, [completed.id, completed.id]);
+	assert.equal(typeof completed.metadata?.completionEnqueuedAt, "number");
+	returnToOwner();
+
+	const reinstall = installUiProjection(
+		context("session-a"),
+		runtime,
+		new Set(),
+		receive,
+	);
+	assert.deepEqual(completions, [completed.id, completed.id]);
+	reinstall();
 });
 
 test("workflow children are grouped under workflow status, not agent counts", () => {

@@ -99,6 +99,8 @@ test("background subagent returns immediately and completes independently", asyn
 		assert.equal(started.background, true);
 		assert.equal(started.agent, "task-auditor");
 		assert.equal(started.metadata?.baseAgent, "background-mock");
+		assert.equal(started.metadata?.completionPending, true);
+		assert.equal(started.metadata?.completionGeneration, 1);
 		assert.equal(TERMINAL_STATES.has(started.state), false);
 
 		const completed = await runtime.wait(started.id, 5000);
@@ -158,6 +160,8 @@ test("foreground standalone subagent can be manually backgrounded", async () => 
 		assert.ok(createdId);
 		const detached = runtime.background(createdId, "session-a");
 		assert.equal(detached.background, true);
+		assert.equal(detached.metadata?.completionPending, true);
+		assert.equal(detached.metadata?.completionGeneration, 1);
 
 		const returned = await foreground;
 		assert.equal(returned.background, true);

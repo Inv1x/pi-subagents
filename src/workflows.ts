@@ -349,6 +349,20 @@ export class WorkflowEngine {
 		this.runtime.updateManagedRun(record.id, "running", {
 			startedAt: record.startedAt ?? Date.now(),
 			error: undefined,
+			...(options.background
+				? {
+						background: true,
+						metadata: {
+							...record.metadata,
+							completionPending: true,
+							completionGeneration: options.existingRunId
+								? Number(record.metadata?.completionGeneration ?? 0) + 1
+								: Number(record.metadata?.completionGeneration ?? 1),
+							completionEnqueuedAt: undefined,
+							completionDeliveredAt: undefined,
+						},
+					}
+				: {}),
 		});
 		let explicitResult: unknown;
 		const assertNodeBudget = (id: string) => {

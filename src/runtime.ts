@@ -231,7 +231,13 @@ export class SubagentRuntime {
 				cost: 0,
 				contextTokens: 0,
 			},
-			metadata: { input, ownerPid: process.pid },
+			metadata: {
+				input,
+				ownerPid: process.pid,
+				...(options.background
+					? { completionPending: true, completionGeneration: 1 }
+					: {}),
+			},
 		};
 		this.records.set(id, record);
 		this.store.create(record);
@@ -304,6 +310,9 @@ export class SubagentRuntime {
 				timeoutMs: request.timeoutMs,
 				writeCapable: isWriteCapable(request.definition),
 				ownerPid: process.pid,
+				...(options.background
+					? { completionPending: true, completionGeneration: 1 }
+					: {}),
 			},
 		};
 		this.records.set(id, record);
@@ -406,6 +415,44 @@ export class SubagentRuntime {
 		return { ...(this.store.read(record.id) ?? this.get(record.id) ?? record) };
 	}
 
+	markCompletionEnqueued(idOrPrefix: string, sessionId: string): RunRecord {
+		const record = this.getForSession(idOrPrefix, sessionId);
+		if (!record) throw new Error(`Run not found: ${idOrPrefix}`);
+		if (
+			record.metadata?.completionDeliveredAt ||
+			record.metadata?.completionEnqueuedAt
+		)
+			return record;
+		this.patch(record, {
+			metadata: { ...record.metadata, completionEnqueuedAt: now() },
+		});
+		return { ...record };
+	}
+
+	clearCompletionEnqueued(idOrPrefix: string, sessionId: string): RunRecord {
+		const record = this.getForSession(idOrPrefix, sessionId);
+		if (!record) throw new Error(`Run not found: ${idOrPrefix}`);
+		if (!record.metadata?.completionEnqueuedAt) return record;
+		this.patch(record, {
+			metadata: { ...record.metadata, completionEnqueuedAt: undefined },
+		});
+		return { ...record };
+	}
+
+	markCompletionDelivered(idOrPrefix: string, sessionId: string): RunRecord {
+		const record = this.getForSession(idOrPrefix, sessionId);
+		if (!record) throw new Error(`Run not found: ${idOrPrefix}`);
+		if (record.metadata?.completionDeliveredAt) return record;
+		this.patch(record, {
+			metadata: {
+				...record.metadata,
+				completionEnqueuedAt: undefined,
+				completionDeliveredAt: now(),
+			},
+		});
+		return { ...record };
+	}
+
 	background(idOrPrefix: string, sessionId?: string): RunRecord {
 		const record = sessionId
 			? this.getForSession(idOrPrefix, sessionId)
@@ -422,7 +469,15 @@ export class SubagentRuntime {
 			);
 		this.patch(record, {
 			background: true,
-			metadata: { ...record.metadata, manuallyBackgroundedAt: now() },
+			metadata: {
+				...record.metadata,
+				manuallyBackgroundedAt: now(),
+				completionPending: true,
+				completionGeneration:
+					Number(record.metadata?.completionGeneration ?? 0) + 1,
+				completionEnqueuedAt: undefined,
+				completionDeliveredAt: undefined,
+			},
 		});
 		this.store.appendEvent(record.id, "run.backgrounded", record.state, {
 			reason: "user_request",

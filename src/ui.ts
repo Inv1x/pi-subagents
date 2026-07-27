@@ -451,10 +451,10 @@ function inspectableFleetRuns(
 export function installUiProjection(
 	ctx: ExtensionContext,
 	runtime: SubagentRuntime,
-	observedRuns: ReadonlySet<string> = new Set(),
+	observedRuns: Pick<ReadonlySet<string>, "has"> = new Set(),
+	onBackgroundCompletion?: (run: RunRecord) => void,
 ): () => void {
 	const sessionId = ctx.sessionManager.getSessionId();
-	const notified = new Set<string>();
 	let expiryTimer: ReturnType<typeof setTimeout> | undefined;
 	const sessionRuns = () => runtime.listForSession(sessionId, ALL_SESSION_RUNS);
 	const activeStandaloneAgents = () =>
@@ -467,6 +467,27 @@ export function installUiProjection(
 					!run.background &&
 					!TERMINAL_STATES.has(run.state),
 			);
+	const deliverCompletion = (run: RunRecord) => {
+		if (
+			!run.background ||
+			!TERMINAL_STATES.has(run.state) ||
+			run.metadata?.completionPending !== true ||
+			run.metadata?.completionDeliveredAt ||
+			run.metadata?.completionEnqueuedAt
+		)
+			return;
+		if (observedRuns.has(run.id)) {
+			runtime.markCompletionDelivered(run.id, sessionId);
+			return;
+		}
+		runtime.markCompletionEnqueued(run.id, sessionId);
+		onBackgroundCompletion?.(run);
+		const severity = run.state === "succeeded" ? "info" : "error";
+		ctx.ui.notify(
+			`${run.agent ?? run.workflow ?? "Run"} ${run.state}`,
+			severity,
+		);
+	};
 	const refresh = (update?: RunUpdate) => {
 		if (update && update.run.sessionId !== sessionId) return;
 		const now = Date.now();
@@ -566,20 +587,8 @@ export function installUiProjection(
 			ctx.ui.setStatus("pi-subagents", undefined);
 		}
 
-		if (
-			update?.run.background &&
-			TERMINAL_STATES.has(update.run.state) &&
-			!notified.has(update.run.id)
-		) {
-			notified.add(update.run.id);
-			if (!observedRuns.has(update.run.id)) {
-				const severity = update.run.state === "succeeded" ? "info" : "error";
-				ctx.ui.notify(
-					`${update.run.agent ?? update.run.workflow ?? "Run"} ${update.run.state}`,
-					severity,
-				);
-			}
-		}
+		if (update) deliverCompletion(update.run);
+		else for (const run of all) deliverCompletion(run);
 	};
 	refresh();
 	const unsubscribe = runtime.subscribe(refresh);
