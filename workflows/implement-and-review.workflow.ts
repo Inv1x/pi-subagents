@@ -16,7 +16,7 @@ function requestOf(input: unknown): string {
 export default defineWorkflow({
 	name: "implement-and-review",
 	description:
-		"Scout, plan, request approval, implement, review concurrently, and apply valid fixes.",
+		"Scout, plan, implement, review concurrently, and apply valid fixes.",
 	async run(ctx, input: unknown) {
 		const request = requestOf(input);
 		const context = await ctx.agent("scout", {
@@ -27,13 +27,9 @@ export default defineWorkflow({
 			agent: "planner",
 			task: `Produce a concrete implementation plan.\n\nRequest:\n${request}\n\nCode context:\n${context.output}`,
 		});
-		await ctx.gate("approve-plan", {
-			title: "Approve implementation plan",
-			summary: plan.output,
-		});
 		const implementation = await ctx.agent("implement", {
 			agent: "worker",
-			task: `Implement this approved request and validate it.\n\nRequest:\n${request}\n\nPlan:\n${plan.output}`,
+			task: `Implement this request and validate it.\n\nRequest:\n${request}\n\nPlan:\n${plan.output}`,
 		});
 		const focuses = [
 			"correctness and regressions",

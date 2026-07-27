@@ -159,8 +159,11 @@ export class SubagentRuntime {
 	}
 
 	listForSession(sessionId: string, limit = 100): RunRecord[] {
-		return this.list(10_000)
+		for (const record of this.store.list(Number.MAX_SAFE_INTEGER))
+			if (!this.records.has(record.id)) this.records.set(record.id, record);
+		return [...this.records.values()]
 			.filter((record) => record.sessionId === sessionId)
+			.sort((a, b) => b.updatedAt - a.updatedAt)
 			.slice(0, limit);
 	}
 

@@ -11,7 +11,7 @@ Build a Pi package that provides a Claude Code-like delegation experience withou
 The package should support two complementary paths:
 
 1. **Interactive delegation** — run one child agent, or let Pi issue several child-agent tool calls in one turn so Pi's native parallel tool execution runs them concurrently.
-2. **Programmatic workflows** — run durable TypeScript workflows that can dynamically fan out to many bounded child agents, join results, branch, loop, pause for approval, and resume safely.
+2. **Programmatic workflows** — run durable TypeScript workflows that can dynamically fan out to many bounded child agents, join results, branch, loop, and resume safely.
 
 The default experience should remain simple:
 
@@ -33,7 +33,7 @@ Claude Code's current design separates several concepts:
 - Worktree isolation is available for agents that edit concurrently.
 - Agent teams add a lead, shared tasks, teammate communication, and explicit user approval before the team is created.
 - Programmatic/headless use exposes streaming events, structured results, session continuation, permission callbacks, and turn limits.
-- The agent-view UI groups work by states such as working, ready for review, needs input, and completed.
+- The agent-view UI groups work by states such as working, ready for review, and completed.
 
 Source used: official Claude Code documentation through Context7 library `/websites/code_claude` (subagents, agent teams, worktrees, Agent SDK, agent view).
 
@@ -191,9 +191,8 @@ Small management schema:
 
 ```ts
 {
-  action: "list" | "status" | "wait" | "approve" | "reject" | "stop" | "resume";
+  action: "list" | "status" | "wait" | "stop" | "resume";
   runId?: string;
-  gateId?: string;
   message?: string;
   timeoutMs?: number;
 }
@@ -245,11 +244,6 @@ export default defineWorkflow({
       dependsOn: ["scout"],
     });
 
-    await ctx.gate("approve-plan", {
-      title: "Approve implementation plan",
-      summary: plan.output,
-    });
-
     const implementation = await ctx.agent("implement", {
       agent: "worker",
       task: plan.output,
@@ -279,7 +273,6 @@ export default defineWorkflow({
 - `ctx.agent(stepId, spec)` — one memoized child step.
 - `ctx.parallel(groupId, specs, options)` — bounded static fan-out.
 - `ctx.map(groupId, items, factory, options)` — bounded dynamic fan-out with a hard item cap.
-- `ctx.gate(gateId, options)` — pause for user approval or input.
 - `ctx.output(stepId)` — retrieve validated prior output.
 - `ctx.log(message, data?)` — append a workflow event without polluting model context.
 - `ctx.setResult(value)` — optional explicit workflow result.
@@ -292,7 +285,7 @@ Normal TypeScript `if`, `for`, `while`, `Promise.all`, and helper functions prov
 Arbitrary JavaScript call stacks cannot be serialized safely. Durability therefore uses deterministic replay:
 
 1. A workflow run restarts from the top after a process crash.
-2. `ctx.agent("stable-id", ...)`, `ctx.map("stable-id", ...)`, and `ctx.gate("stable-id", ...)` check the run store.
+2. `ctx.agent("stable-id", ...)` and `ctx.map("stable-id", ...)` check the run store.
 3. Completed steps return their persisted result without re-running.
 4. Running steps whose owner died become `orphaned` and follow configured retry policy.
 5. Reusing an ID with a changed normalized specification fails with a workflow-drift error unless the user explicitly forks/restarts the run.
@@ -319,7 +312,7 @@ Orchestrator runner process (for workflows/background runs)
 ├── Deterministic step runtime
 ├── Global/per-run concurrency leases
 ├── Child transport
-├── Gate handling
+├── Cancellation handling
 └── Durable run store
 
 Child Pi process
@@ -377,7 +370,6 @@ Run/node states:
 
 ```text
 queued → starting → running ─┬→ succeeded
-                            ├→ needs_input → running
                             ├→ paused → running
                             ├→ failed
                             ├→ timed_out
@@ -476,7 +468,7 @@ Behavior:
 
 - Reuse `context.lastComponent` for efficient streaming updates.
 - Show the last few meaningful activities, not every token delta.
-- Expanded view (`app.tools.expand`, normally Ctrl+O) shows task, tool timeline, final Markdown, usage, model, workspace, artifact paths, and failure details.
+- Expanded view (`app.tools.expand`, normally `Ctrl+O`) shows task, tool timeline, final Markdown, usage, model, workspace, artifact paths, and failure details.
 - Use text glyphs plus labels; color is not the only state signal.
 
 When Pi emits several sibling `subagent_run` calls, each gets its own native tool row and all share the fleet status projection.
@@ -488,10 +480,10 @@ The shipped 0.5.0 UI intentionally avoids an above-editor widget. Active and rec
 ### 8.3 Footer status
 
 ```text
-2 agents running · 1 workflow needs input · $0.41 · /subagents-fleet
+2 agents running · 1 workflow running · $0.41 · /subagents-fleet
 ```
 
-Keep it compact, session-scoped, and remove it when no run is relevant to the current session. When `pi-ui-customization` is loaded and the main editor is empty, its editor-scoped navigation uses Up/Down to select the status and Enter to open `/subagents-fleet`; selectors and overlays retain their own input ownership.
+Keep it compact, session-scoped, and remove it when no run is relevant to the current session. Count workflow parents as workflows rather than counting their child agents; retain an entire finished workflow family for five minutes after its last child activity. When `pi-ui-customization` is loaded and the main editor is empty, its editor-scoped navigation uses `Up`/`Down` to select the status and `Enter` to open `/subagents-fleet`; selectors and overlays retain their own input ownership.
 
 ### 8.4 Fleet overlay
 
@@ -499,8 +491,8 @@ Keep it compact, session-scoped, and remove it when no run is relevant to the cu
 
 - Left: grouped runs and children with state, agent, elapsed time.
 - Right: selected child task, current tool, transcript tail, usage, model, workspace, output/patch/session paths.
-- Filters: current session, running, needs input, recent, all.
-- Keys: arrows select runs, `g/G` jump first/last, `j/k` scroll output, `b` backgrounds an eligible standalone agent, `r` refreshes, and Esc closes.
+- Filters: current session, running, recent, all.
+- Keys: `Up`/`Down` select runs, `g`/`G` jump first/last, `j`/`k` scroll output, `b` backgrounds an eligible standalone agent, `r` refreshes, and `Esc`, `Ctrl+C`, or `q` closes.
 - Other mutations stay in explicit commands.
 - Narrow terminals fall back to one pane or textual status.
 
@@ -511,7 +503,6 @@ Keep it compact, session-scoped, and remove it when no run is relevant to the cu
 ```text
 ✓ scout
 ✓ plan
-■ approve-plan       needs approval
 ◦ implement
 ├─ ◦ review:correctness
 ├─ ◦ review:tests
@@ -527,7 +518,6 @@ Notify only on:
 
 - Background run completed.
 - Run failed/timed out.
-- Approval or user input required.
 - Run appears orphaned/stalled.
 
 Do not notify for every child tool call. In non-TUI modes, emit structured events/artifacts and avoid UI APIs.
@@ -540,7 +530,7 @@ Do not notify for every child tool call. In non-TUI modes, emit structured event
 - Confirm project-local agent prompts the first time they are invoked interactively.
 - Show an additional launch preview for project-local TypeScript workflows because they execute arbitrary code.
 - Child tool allowlists should be strict; unknown tools are rejected rather than silently ignored.
-- Background runs must not wait on an invisible interactive permission prompt. Unsupported “ask” policies fail with a clear `needs_input` result or require a supervisor bridge in a later milestone.
+- Background runs must not wait on an invisible interactive permission prompt. Unsupported “ask” policies fail clearly or require a supervisor bridge in a later milestone.
 - Redact obvious credentials from diagnostic/event previews, but do not claim redaction is a security boundary.
 - Support external container/sandbox transport later instead of inventing a partial in-process sandbox.
 
@@ -608,8 +598,8 @@ Exit: a background run survives parent UI reload/session switching, remains insp
 
 - `defineWorkflow()` and workflow discovery.
 - `workflow_run`/`workflow_control`.
-- Stable-ID replay, `agent`, `parallel`, `map`, `gate`, structured output.
-- Workflow graph projection and approval UI.
+- Stable-ID replay, `agent`, `parallel`, `map`, structured output.
+- Workflow graph projection.
 - Dynamic fan-out and hard node/concurrency/budget bounds.
 - Built-in `scout-plan`, `parallel-review`, and `implement-and-review` workflows.
 
@@ -644,7 +634,7 @@ These are deliberately not v1 requirements.
 - State transition legality and event reducer determinism.
 - UTF-8 chunk splitting, oversized JSONL lines, malformed/final unterminated events.
 - Output/stderr truncation.
-- Workflow stable-ID memoization, drift detection, replay, gates, and fail-fast/collect behavior.
+- Workflow stable-ID memoization, drift detection, replay, and fail-fast/collect behavior.
 - Workspace writer classification and lease conflicts.
 - Worktree path validation and cleanup.
 
@@ -667,7 +657,7 @@ Simulate:
 - Assert every rendered line fits width by visible ANSI width.
 - Theme invalidation rebuilds pre-colored content.
 - Fleet selection survives refresh and list reordering.
-- Empty, queued, running, needs-input, mixed-failure, and completed states.
+- Empty, queued, running, mixed-failure, and completed states.
 
 ### Optional live E2E
 

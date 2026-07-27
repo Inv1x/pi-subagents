@@ -22,7 +22,6 @@ import type {
 	WorkflowAgentSpec,
 	WorkflowContext,
 	WorkflowDefinition,
-	WorkflowGateOptions,
 	WorkflowMapOptions,
 } from "./workflow-api.ts";
 
@@ -138,17 +137,9 @@ interface WorkflowExecutionOptions {
 		thinking: ResolvedAgentRunRequest["thinking"],
 	) => ResolvedAgentRunRequest["thinking"];
 	resolveAgent: (name: string) => AgentDefinition | undefined;
-	gateHandler?: (
-		gateId: string,
-		options: WorkflowGateOptions,
-	) => Promise<boolean>;
 	signal?: AbortSignal;
 	onCreated?: (record: RunRecord) => void;
 	existingRunId?: string;
-}
-
-interface GateWaiter {
-	resolve(approved: boolean): void;
 }
 
 interface ActiveWorkflow {
@@ -186,7 +177,6 @@ function stepError(error: unknown): RunError {
 
 export class WorkflowEngine {
 	private readonly active = new Map<string, ActiveWorkflow>();
-	private readonly gates = new Map<string, GateWaiter>();
 
 	constructor(private readonly runtime: SubagentRuntime) {}
 
@@ -282,14 +272,6 @@ export class WorkflowEngine {
 			signal,
 			abortMessage: `Stopped waiting for workflow ${record.id}; it continues in the background.`,
 		});
-	}
-
-	approve(runIdValue: string, gateId: string, approved: boolean): void {
-		const key = `${runIdValue}:${gateId}`;
-		const waiter = this.gates.get(key);
-		if (!waiter) throw new Error(`Workflow gate is not waiting: ${key}`);
-		waiter.resolve(approved);
-		this.gates.delete(key);
 	}
 
 	stop(idOrPrefix: string): RunRecord {
@@ -428,69 +410,6 @@ export class WorkflowEngine {
 			parallel: (groupId, specs, mapOptions) =>
 				runMap(groupId, specs, (_spec) => _spec, mapOptions),
 			map: runMap,
-			async gate(
-				gateId: string,
-				gateOptions: WorkflowGateOptions,
-			): Promise<void> {
-				assertNodeBudget(gateId);
-				const specHash = hash(gateOptions);
-				const existing = snapshot.steps[gateId];
-				if (existing) {
-					if (existing.specHash !== specHash)
-						throw new Error(`Workflow drift at gate '${gateId}'.`);
-					if (existing.state === "succeeded") return;
-				}
-				const gate: WorkflowStepRecord = {
-					id: gateId,
-					kind: "gate",
-					state: "needs_input",
-					specHash,
-					createdAt: existing?.createdAt ?? Date.now(),
-					updatedAt: Date.now(),
-					metadata: { ...gateOptions },
-				};
-				persistStep(gate);
-				workflowEngine.setSnapshotState(snapshot, "needs_input");
-				workflowEngine.runtime.updateManagedRun(record.id, "needs_input", {
-					activity: { message: gateOptions.title, updatedAt: Date.now() },
-				});
-				let approved: boolean;
-				if (options.gateHandler && !options.background)
-					approved = await options.gateHandler(gateId, gateOptions);
-				else {
-					const gateKey = `${record.id}:${gateId}`;
-					approved = await new Promise<boolean>((resolve, reject) => {
-						const abort = () => {
-							workflowEngine.gates.delete(gateKey);
-							reject(
-								controller.signal.reason ??
-									new Error("Workflow cancelled while awaiting approval"),
-							);
-						};
-						controller.signal.addEventListener("abort", abort, { once: true });
-						workflowEngine.gates.set(gateKey, {
-							resolve(value) {
-								controller.signal.removeEventListener("abort", abort);
-								resolve(value);
-							},
-						});
-					});
-				}
-				if (!approved) {
-					gate.state = "cancelled";
-					gate.updatedAt = Date.now();
-					persistStep(gate);
-					throw new Error(`Workflow gate '${gateId}' was rejected.`);
-				}
-				gate.state = "succeeded";
-				gate.result = { approved: true };
-				gate.updatedAt = Date.now();
-				persistStep(gate);
-				workflowEngine.setSnapshotState(snapshot, "running");
-				workflowEngine.runtime.updateManagedRun(record.id, "running", {
-					activity: undefined,
-				});
-			},
 			log: (message, data) => {
 				this.runtime.store.appendEvent(
 					record.id,

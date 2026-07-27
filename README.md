@@ -9,7 +9,7 @@ Focused subagents and bounded programmatic workflows for [Pi](https://github.com
 - One global scheduler with foreground priority, concurrency limits, and shared-workspace writer leases.
 - Foreground and background runs with streaming activity, usage, cancellation, timeout, and bounded output.
 - Durable versioned run artifacts under `~/.pi/agent/subagents/runs/`.
-- Programmatic TypeScript workflows with stable steps, dynamic fan-out, joins, approval gates, and replay.
+- Programmatic TypeScript workflows with stable steps, dynamic fan-out, joins, and replay.
 - Worktree isolation with patch capture for write-capable children.
 - Session-scoped run status and a polished recent-run fleet inspector.
 - Built-in `general`, `scout`, `planner`, `reviewer`, and `worker` roles, with task-specific run names that can inherit any role.
@@ -66,8 +66,6 @@ Run the scout-plan workflow for adding rate limiting.
 Run implement-and-review in the background for this request.
 ```
 
-`implement-and-review` pauses at `approve-plan`. Approve it with `workflow_control` or through the foreground confirmation dialog.
-
 ### Authoring a workflow
 
 Create `~/.pi/agent/workflows/example.workflow.ts` or, in a trusted project, `.pi/workflows/example.workflow.ts`:
@@ -101,13 +99,12 @@ Workflow context methods:
 - `ctx.agent(stepId, spec)`
 - `ctx.parallel(groupId, specs, options?)`
 - `ctx.map(groupId, items, factory, options?)`
-- `ctx.gate(gateId, { title, summary })`
 - `ctx.output(stepId)`
 - `ctx.log(message, data?)`
 - `ctx.setResult(value)`
 - `ctx.signal`
 
-Project TypeScript workflows are arbitrary local code and require project trust plus a launch preview by default.
+Workflows cannot pause for approval or other runtime input; split interactive decision points into separate workflows. Project TypeScript workflows are arbitrary local code and require project trust plus a launch preview by default.
 
 ## Custom agents
 
@@ -197,7 +194,7 @@ Runs a named TypeScript workflow with arbitrary JSON-compatible input.
 
 ### `workflow_control`
 
-Actions: `list`, `status`, `wait`, `approve`, `reject`, `stop`, `resume`.
+Actions: `list`, `status`, `wait`, `stop`, `resume`.
 
 ## Commands
 
@@ -266,7 +263,7 @@ Model-visible output is capped; full output remains in `output.md`. JSON event l
 
 After Pi exhausts its own provider-level retries, the extension retries a child process for recognized transient failures such as WebSocket disconnects, connection resets, rate limits, and 5xx responses. Retries use bounded exponential backoff, preserve cumulative usage/cost and attempt history, and stay within the original run timeout. To avoid repeating side effects, the extension does not restart a child after it has invoked `bash`, `edit`, or `write`. Set `maxRetries` to `0` globally or per run to disable process-level retries.
 
-The current session's active fleet is summarized in one compact status line. Finished runs remain visible for five minutes, matching the inspector's recent-run window. Open the fleet inspector with `/subagents-fleet`; with `pi-ui-customization` loaded, an empty editor can use Up/Down to select the footer status and Enter to open it. That navigation is owned by the editor only, so selectors and overlays keep normal ownership of their keys. The inspector groups workflow children beneath their parent, uses state-colored markers, and shows run metadata and scrollable output in a separate panel. Use Up/Down to select runs, `g`/`G` to jump, and `j`/`k` to scroll output. Detailed output remains available through the control tools. Set `showStatus` to `false` to hide the summary; the former `showWidget: false` setting is still honored for compatibility.
+The current session's active fleet is summarized in one compact status line. Workflow children are represented by their workflow rather than counted as standalone agents. Finished standalone runs remain visible for five minutes; workflow families remain visible together until five minutes after their last child activity, so the inspector keeps every agent run by a visible workflow. Open the fleet inspector with `/subagents-fleet`; with `pi-ui-customization` loaded, an empty editor can use `Up`/`Down` to select the footer status and `Enter` to open it. The extension opts this status into preserving its accent color during selection, so terminal inversion uses that color as the selected background. That navigation is owned by the editor only, so selectors and overlays keep normal ownership of their keys. The inspector groups workflow children beneath their parent, uses state-colored markers, and shows run metadata and scrollable output in a separate panel. Use `Up`/`Down` to select runs, `g`/`G` to jump, `j`/`k` to scroll output, `b` to background an eligible run, `r` to refresh, and `Esc`, `Ctrl+C`, or `q` to close. Detailed output remains available through the control tools. Set `showStatus` to `false` to hide the summary; the former `showWidget: false` setting is still honored for compatibility.
 
 ## Background lifecycle
 
@@ -285,6 +282,6 @@ npm test
 pi -e . --list-models
 ```
 
-Tests cover protocol framing and limits, scheduler concurrency/resource leases, trust-aware discovery, child JSON event parsing, compact UI rendering, status projection, and workflow fan-out/gates/persistence.
+Tests cover protocol framing and limits, scheduler concurrency/resource leases, trust-aware discovery, child JSON event parsing, compact UI rendering, status projection, and workflow fan-out/persistence.
 
 See [`PLAN.md`](PLAN.md) for the product research, architecture decisions, UI rationale, and later milestones.

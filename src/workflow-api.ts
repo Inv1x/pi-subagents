@@ -36,11 +36,6 @@ export interface WorkflowMapOptions {
 	failFast?: boolean;
 }
 
-export interface WorkflowGateOptions {
-	title: string;
-	summary: string;
-}
-
 export interface WorkflowContext {
 	readonly runId: string;
 	readonly cwd: string;
@@ -57,7 +52,6 @@ export interface WorkflowContext {
 		factory: (item: T, index: number) => WorkflowAgentSpec,
 		options?: WorkflowMapOptions,
 	): Promise<WorkflowAgentResult[]>;
-	gate(gateId: string, options: WorkflowGateOptions): Promise<void>;
 	log(message: string, data?: Record<string, unknown>): void;
 	output<T = unknown>(stepId: string): T | undefined;
 	setResult(value: unknown): void;

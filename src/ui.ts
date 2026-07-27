@@ -1,4 +1,7 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionContext,
+	KeybindingsManager,
+} from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import {
 	type Component,
@@ -49,8 +52,6 @@ function glyph(state: RunRecord["state"]): string {
 		case "cancelled":
 		case "paused":
 			return "■";
-		case "needs_input":
-			return "?";
 		case "queued":
 			return "◦";
 		default:
@@ -64,8 +65,7 @@ function stateColor(
 	if (state === "succeeded") return "success";
 	if (state === "failed" || state === "timed_out" || state === "orphaned")
 		return "error";
-	if (state === "needs_input" || state === "cancelled" || state === "paused")
-		return "warning";
+	if (state === "cancelled" || state === "paused") return "warning";
 	if (state === "queued") return "muted";
 	return "accent";
 }
@@ -229,6 +229,128 @@ export function renderRunCall(
 	);
 }
 
+type RunRenderLifecycle = {
+	lastComponent?: Component;
+	invalidate?: () => void;
+	resolveRun?: (runId: string) => RunRecord | undefined;
+};
+
+const LIVE_RUN_TICK_MS = 1000;
+const LIVE_RUN_STALE_MS = 2500;
+
+class LiveRunComponent implements Component {
+	private run: RunRecord;
+	private recentActivity: string[] | undefined;
+	private expanded: boolean;
+	private theme: ExtensionContext["ui"]["theme"];
+	private invalidateRow: (() => void) | undefined;
+	private resolveRun: ((runId: string) => RunRecord | undefined) | undefined;
+	private lastRenderedAt = Date.now();
+
+	constructor(
+		run: RunRecord,
+		recentActivity: string[] | undefined,
+		expanded: boolean,
+		theme: ExtensionContext["ui"]["theme"],
+		lifecycle: RunRenderLifecycle,
+	) {
+		this.resolveRun = lifecycle.resolveRun;
+		this.run = this.resolveRun?.(run.id) ?? run;
+		this.recentActivity = recentActivity;
+		this.expanded = expanded;
+		this.theme = theme;
+		this.invalidateRow = lifecycle.invalidate;
+		this.syncTicker();
+	}
+
+	update(
+		run: RunRecord,
+		recentActivity: string[] | undefined,
+		expanded: boolean,
+		theme: ExtensionContext["ui"]["theme"],
+		lifecycle: RunRenderLifecycle,
+	): void {
+		this.resolveRun = lifecycle.resolveRun;
+		this.run = this.resolveRun?.(run.id) ?? run;
+		this.recentActivity = recentActivity;
+		this.expanded = expanded;
+		this.theme = theme;
+		this.invalidateRow = lifecycle.invalidate;
+		this.syncTicker();
+	}
+
+	private syncTicker(): void {
+		if (TERMINAL_STATES.has(this.run.state) || !this.invalidateRow)
+			unregisterLiveRunComponent(this);
+		else registerLiveRunComponent(this);
+	}
+
+	tick(now: number): void {
+		if (now - this.lastRenderedAt > LIVE_RUN_STALE_MS) {
+			unregisterLiveRunComponent(this);
+			return;
+		}
+		const latest = this.resolveRun?.(this.run.id);
+		if (latest) this.run = latest;
+		this.invalidateRow?.();
+		if (TERMINAL_STATES.has(this.run.state)) unregisterLiveRunComponent(this);
+	}
+
+	render(width: number): string[] {
+		this.lastRenderedAt = Date.now();
+		this.syncTicker();
+		const component = this.expanded
+			? expandedRun(this.run, this.recentActivity, this.theme)
+			: collapsedRun(this.run, this.theme, false);
+		return component.render(width);
+	}
+
+	invalidate(): void {}
+
+	dispose(): void {
+		unregisterLiveRunComponent(this);
+	}
+}
+
+const liveRunRefs = new Set<WeakRef<LiveRunComponent>>();
+const liveRunRegistrations = new WeakMap<
+	LiveRunComponent,
+	WeakRef<LiveRunComponent>
+>();
+let liveRunTicker: ReturnType<typeof setInterval> | undefined;
+
+function registerLiveRunComponent(component: LiveRunComponent): void {
+	if (liveRunRegistrations.has(component)) return;
+	const reference = new WeakRef(component);
+	liveRunRegistrations.set(component, reference);
+	liveRunRefs.add(reference);
+	if (liveRunTicker) return;
+	liveRunTicker = setInterval(() => {
+		const now = Date.now();
+		for (const candidate of liveRunRefs) {
+			const live = candidate.deref();
+			if (live) live.tick(now);
+			else liveRunRefs.delete(candidate);
+		}
+		if (!liveRunRefs.size) stopLiveRunTicker();
+	}, LIVE_RUN_TICK_MS);
+	liveRunTicker.unref?.();
+}
+
+function unregisterLiveRunComponent(component: LiveRunComponent): void {
+	const reference = liveRunRegistrations.get(component);
+	if (!reference) return;
+	liveRunRegistrations.delete(component);
+	liveRunRefs.delete(reference);
+	if (!liveRunRefs.size) stopLiveRunTicker();
+}
+
+function stopLiveRunTicker(): void {
+	if (!liveRunTicker) return;
+	clearInterval(liveRunTicker);
+	liveRunTicker = undefined;
+}
+
 export function renderRunResult(
 	result: {
 		content: Array<{ type: string; text?: string }>;
@@ -236,19 +358,38 @@ export function renderRunResult(
 	},
 	options: { expanded: boolean; isPartial?: boolean },
 	theme: ExtensionContext["ui"]["theme"],
+	lifecycle: RunRenderLifecycle = {},
 ): Component {
 	const details = result.details as SubagentToolDetails | undefined;
 	const run = details?.run;
-	if (!run)
+	if (!run) {
+		if (lifecycle.lastComponent instanceof LiveRunComponent)
+			lifecycle.lastComponent.dispose();
 		return new Text(
 			result.content.find((part) => part.type === "text")?.text ??
 				"(no output)",
 			0,
 			0,
 		);
-	return options.expanded
-		? expandedRun(run, details.recentActivity, theme)
-		: collapsedRun(run, theme, false);
+	}
+	const component =
+		lifecycle.lastComponent instanceof LiveRunComponent
+			? lifecycle.lastComponent
+			: new LiveRunComponent(
+					run,
+					details.recentActivity,
+					options.expanded,
+					theme,
+					lifecycle,
+				);
+	component.update(
+		run,
+		details.recentActivity,
+		options.expanded,
+		theme,
+		lifecycle,
+	);
+	return component;
 }
 
 export function renderControlCall(
@@ -292,6 +433,7 @@ export function renderControlResult(
 }
 
 const RECENT_RUN_WINDOW_MS = 5 * 60_000;
+const ALL_SESSION_RUNS = Number.MAX_SAFE_INTEGER;
 
 type FleetOverlayState = {
 	handle?: OverlayHandle;
@@ -337,11 +479,46 @@ export function closeFleet(runtime: SubagentRuntime, sessionId: string): void {
 	getFleetOverlayState(runtime, sessionId)?.close?.();
 }
 
-function isInspectableRun(run: RunRecord, now = Date.now()): boolean {
-	return (
-		!TERMINAL_STATES.has(run.state) ||
-		run.updatedAt >= now - RECENT_RUN_WINDOW_MS
+function workflowFamilyActivity(runs: RunRecord[]): Map<string, number> {
+	const activity = new Map<string, number>();
+	for (const run of runs) {
+		if (run.kind === "workflow") activity.set(run.id, run.updatedAt);
+	}
+	for (const run of runs) {
+		if (!run.parentRunId || !activity.has(run.parentRunId)) continue;
+		activity.set(
+			run.parentRunId,
+			Math.max(activity.get(run.parentRunId) ?? 0, run.updatedAt),
+		);
+	}
+	return activity;
+}
+
+function inspectableFleetRuns(
+	runs: RunRecord[],
+	now = Date.now(),
+): RunRecord[] {
+	const familyActivity = workflowFamilyActivity(runs);
+	const inspectableWorkflows = new Set(
+		runs
+			.filter(
+				(run) =>
+					run.kind === "workflow" &&
+					(!TERMINAL_STATES.has(run.state) ||
+						(familyActivity.get(run.id) ?? run.updatedAt) >=
+							now - RECENT_RUN_WINDOW_MS),
+			)
+			.map((run) => run.id),
 	);
+	return runs.filter((run) => {
+		if (run.kind === "workflow") return inspectableWorkflows.has(run.id);
+		if (run.parentRunId && familyActivity.has(run.parentRunId))
+			return inspectableWorkflows.has(run.parentRunId);
+		return (
+			!TERMINAL_STATES.has(run.state) ||
+			run.updatedAt >= now - RECENT_RUN_WINDOW_MS
+		);
+	});
 }
 
 export function installUiProjection(
@@ -352,7 +529,7 @@ export function installUiProjection(
 	const sessionId = ctx.sessionManager.getSessionId();
 	const notified = new Set<string>();
 	let expiryTimer: ReturnType<typeof setTimeout> | undefined;
-	const sessionRuns = (limit = 200) => runtime.listForSession(sessionId, limit);
+	const sessionRuns = () => runtime.listForSession(sessionId, ALL_SESSION_RUNS);
 	const activeStandaloneAgents = () =>
 		runtime
 			.listForSession(sessionId, 200)
@@ -366,40 +543,54 @@ export function installUiProjection(
 	const refresh = (update?: RunUpdate) => {
 		if (update && update.run.sessionId !== sessionId) return;
 		const now = Date.now();
-		const all = sessionRuns(500);
-		const active = all.filter((run) => !TERMINAL_STATES.has(run.state));
-		const recentFinished = all.filter(
+		const all = sessionRuns();
+		const familyActivity = workflowFamilyActivity(all);
+		const inspectable = inspectableFleetRuns(all, now);
+		const standaloneAgents = all.filter(
+			(run) => run.kind === "agent" && !run.parentRunId,
+		);
+		const workflows = all.filter((run) => run.kind === "workflow");
+		const activeAgents = standaloneAgents.filter(
+			(run) => !TERMINAL_STATES.has(run.state),
+		);
+		const activeWorkflows = workflows.filter(
+			(run) => !TERMINAL_STATES.has(run.state),
+		);
+		const recentFinishedAgents = standaloneAgents.filter(
 			(run) =>
 				TERMINAL_STATES.has(run.state) &&
 				run.updatedAt >= now - RECENT_RUN_WINDOW_MS,
 		);
-		const inspectable = [...active, ...recentFinished];
-		const agents = active.filter((run) => run.kind === "agent");
-		const workflows = active.filter((run) => run.kind === "workflow");
-		const finishedAgents = recentFinished.filter(
-			(run) => run.kind === "agent",
+		const recentFinishedWorkflows = workflows.filter(
+			(run) =>
+				TERMINAL_STATES.has(run.state) &&
+				(familyActivity.get(run.id) ?? run.updatedAt) >=
+					now - RECENT_RUN_WINDOW_MS,
+		);
+		const queuedAgents = activeAgents.filter(
+			(run) => run.state === "queued",
 		).length;
-		const finishedWorkflows = recentFinished.filter(
-			(run) => run.kind === "workflow",
-		).length;
-		const queuedAgents = agents.filter((run) => run.state === "queued").length;
-		const runningAgents = agents.filter(
+		const runningAgents = activeAgents.filter(
 			(run) => run.state === "running" || run.state === "starting",
 		).length;
-		const waitingWorkflows = workflows.filter(
-			(run) => run.state === "needs_input",
-		).length;
-		const runningWorkflows = workflows.filter(
+		const runningWorkflows = activeWorkflows.filter(
 			(run) => run.state === "running" || run.state === "starting",
 		).length;
-		const queuedWorkflows = workflows.filter(
+		const queuedWorkflows = activeWorkflows.filter(
 			(run) => run.state === "queued",
 		).length;
 		if (expiryTimer) clearTimeout(expiryTimer);
 		expiryTimer = undefined;
-		const nextExpiry = recentFinished.reduce(
-			(earliest, run) =>
-				Math.min(earliest, run.updatedAt + RECENT_RUN_WINDOW_MS),
+		const nextExpiry = [
+			...recentFinishedAgents.map(
+				(run) => run.updatedAt + RECENT_RUN_WINDOW_MS,
+			),
+			...recentFinishedWorkflows.map(
+				(run) =>
+					(familyActivity.get(run.id) ?? run.updatedAt) + RECENT_RUN_WINDOW_MS,
+			),
+		].reduce(
+			(earliest, expiresAt) => Math.min(earliest, expiresAt),
 			Number.POSITIVE_INFINITY,
 		);
 		if (Number.isFinite(nextExpiry)) {
@@ -418,49 +609,36 @@ export function installUiProjection(
 				queuedAgents
 					? `${formatCount(queuedAgents, "agent")} queued`
 					: undefined,
-				waitingWorkflows
-					? `${formatCount(waitingWorkflows, "workflow")} needs input`
-					: undefined,
-				!agents.length && runningWorkflows
+				runningWorkflows
 					? `${formatCount(runningWorkflows, "workflow")} running`
 					: undefined,
-				!agents.length && queuedWorkflows
+				queuedWorkflows
 					? `${formatCount(queuedWorkflows, "workflow")} queued`
 					: undefined,
-				finishedAgents
-					? `${formatCount(finishedAgents, "agent")} finished`
+				recentFinishedAgents.length
+					? `${formatCount(recentFinishedAgents.length, "agent")} finished`
 					: undefined,
-				!agents.length && !finishedAgents && finishedWorkflows
-					? `${formatCount(finishedWorkflows, "workflow")} finished`
+				recentFinishedWorkflows.length
+					? `${formatCount(recentFinishedWorkflows.length, "workflow")} finished`
 					: undefined,
 			].filter((piece): piece is string => Boolean(piece));
+			const inspectableJobs = inspectable.filter(
+				(run) => run.kind === "workflow" || !run.parentRunId,
+			).length;
 			const pieces = [
 				...(activity.length
 					? activity
-					: [`${formatCount(inspectable.length, "run")} available`]),
+					: [`${formatCount(inspectableJobs, "run")} available`]),
 				`$${totalCost.toFixed(2)}`,
 				"/subagents-fleet",
-				activeStandaloneAgents().length ? "ctrl+b background" : undefined,
+				activeStandaloneAgents().length ? "Ctrl+B background" : undefined,
 			].filter((piece): piece is string => Boolean(piece));
-			const status = ctx.ui.theme.fg(
-				waitingWorkflows ? "warning" : "accent",
-				pieces.join(" · "),
-			);
+			const status = ctx.ui.theme.fg("accent", pieces.join(" · "));
 			ctx.ui.setStatus("pi-subagents", status);
 		} else {
 			ctx.ui.setStatus("pi-subagents", undefined);
 		}
 
-		if (
-			update?.run.background &&
-			update.run.state === "needs_input" &&
-			update.previousState !== "needs_input"
-		) {
-			ctx.ui.notify(
-				`${update.run.workflow ?? "Workflow"} needs approval or input [${update.run.id.slice(0, 12)}]`,
-				"warning",
-			);
-		}
 		if (
 			update?.run.background &&
 			TERMINAL_STATES.has(update.run.state) &&
@@ -506,6 +684,53 @@ export function installUiProjection(
 		ctx.ui.setStatus("pi-subagents", undefined);
 		ctx.ui.setWidget("pi-subagents", undefined);
 	};
+}
+
+const KEY_NAMES: Readonly<Record<string, string>> = {
+	escape: "Esc",
+	enter: "Enter",
+	up: "Up",
+	down: "Down",
+	left: "Left",
+	right: "Right",
+	pageup: "PageUp",
+	pagedown: "PageDown",
+	tab: "Tab",
+	backspace: "Backspace",
+	delete: "Delete",
+	home: "Home",
+	end: "End",
+	space: "Space",
+};
+
+function keyLabel(key: string): string {
+	return key
+		.split("+")
+		.map((part, index, parts) => {
+			const lower = part.toLowerCase();
+			if (lower === "ctrl") return "Ctrl";
+			if (lower === "alt") return "Alt";
+			if (lower === "shift") return "Shift";
+			const named = KEY_NAMES[lower];
+			if (named) return named;
+			if (part.length === 1)
+				return parts.length > 1 && index === parts.length - 1
+					? part.toUpperCase()
+					: part;
+			return part.charAt(0).toUpperCase() + part.slice(1);
+		})
+		.join("+");
+}
+
+function configuredKeyGroup(
+	keybindings: KeybindingsManager,
+	bindings: Array<Parameters<KeybindingsManager["getKeys"]>[0]>,
+	extra: string[] = [],
+): string {
+	const keys = bindings.flatMap((binding) =>
+		keybindings.getKeys(binding).map(keyLabel),
+	);
+	return [...new Set([...keys, ...extra])].join("/") || "Unbound";
 }
 
 function fit(text: string, width: number): string {
@@ -583,6 +808,7 @@ class FleetComponent implements Component {
 	constructor(
 		private readonly tui: TUI,
 		private readonly theme: ExtensionContext["ui"]["theme"],
+		private readonly keybindings: KeybindingsManager,
 		private readonly runtime: SubagentRuntime,
 		private readonly sessionId: string,
 		private readonly done: () => void,
@@ -600,9 +826,9 @@ class FleetComponent implements Component {
 	private refresh(): void {
 		const selectedId = this.runs[this.selected]?.id;
 		this.runs = orderFleetRuns(
-			this.runtime
-				.listForSession(this.sessionId, 200)
-				.filter((run) => isInspectableRun(run)),
+			inspectableFleetRuns(
+				this.runtime.listForSession(this.sessionId, ALL_SESSION_RUNS),
+			),
 		);
 		const next = selectedId
 			? this.runs.findIndex((run) => run.id === selectedId)
@@ -620,18 +846,18 @@ class FleetComponent implements Component {
 
 	handleInput(data: string): void {
 		if (
-			matchesKey(data, "escape") ||
-			matchesKey(data, "ctrl+c") ||
+			this.keybindings.matches(data, "tui.select.cancel") ||
+			this.keybindings.matches(data, "app.interrupt") ||
 			data === "q"
 		) {
 			this.done();
 			return;
 		}
-		if (matchesKey(data, "up")) {
+		if (this.keybindings.matches(data, "tui.select.up")) {
 			const previous = this.selected;
 			this.selected = Math.max(0, this.selected - 1);
 			if (this.selected !== previous) this.outputScroll = 0;
-		} else if (matchesKey(data, "down")) {
+		} else if (this.keybindings.matches(data, "tui.select.down")) {
 			const previous = this.selected;
 			this.selected = Math.min(
 				Math.max(0, this.runs.length - 1),
@@ -677,7 +903,9 @@ class FleetComponent implements Component {
 		const leftInner = leftWidth - 2;
 		const rightInner = rightWidth - 2;
 		const activeCount = this.runs.filter(
-			(run) => !TERMINAL_STATES.has(run.state),
+			(run) =>
+				!TERMINAL_STATES.has(run.state) &&
+				(run.kind === "workflow" || !run.parentRunId),
 		).length;
 		const header = splitColumns(
 			` ${this.theme.bold(this.theme.fg("accent", "Subagent fleet"))}`,
@@ -770,11 +998,20 @@ class FleetComponent implements Component {
 		const lines = [header];
 		for (let index = 0; index < panelHeight; index++)
 			lines.push(`${leftPanel[index] ?? ""} ${rightPanel[index] ?? ""}`);
+		const selectKeys = configuredKeyGroup(this.keybindings, [
+			"tui.select.up",
+			"tui.select.down",
+		]);
+		const closeKeys = configuredKeyGroup(
+			this.keybindings,
+			["tui.select.cancel", "app.interrupt"],
+			["q"],
+		);
 		lines.push(
 			truncateToWidth(
 				this.theme.fg(
 					"dim",
-					" ↑↓ select · g/G first/last · j/k scroll output · b background · r refresh · Esc close",
+					` ${selectKeys} select · g/G first/last · j/k scroll output · b background · r refresh · ${closeKeys} close`,
 				),
 				width,
 				"",
@@ -813,7 +1050,7 @@ export async function openFleet(
 	if (!state) return;
 	try {
 		await ctx.ui.custom<undefined>(
-			(tui, theme, _keys, done) => {
+			(tui, theme, keybindings, done) => {
 				let closed = false;
 				const close = () => {
 					if (closed) return;
@@ -823,7 +1060,14 @@ export async function openFleet(
 					done(undefined);
 				};
 				state.close = close;
-				return new FleetComponent(tui, theme, runtime, sessionId, close);
+				return new FleetComponent(
+					tui,
+					theme,
+					keybindings,
+					runtime,
+					sessionId,
+					close,
+				);
 			},
 			{
 				overlay: true,

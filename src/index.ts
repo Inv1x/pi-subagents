@@ -45,6 +45,7 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 		"Agent discovery scope. Defaults to both for trusted projects and user otherwise.",
 });
 const STATUS_ACTIVATION_EVENT = "pi-ui-customization:activate-status";
+const STATUS_OPTIONS_EVENT = "pi-ui-customization:status-options";
 const STATUS_KEY = "pi-subagents";
 
 type StatusActivation = {
@@ -159,17 +160,8 @@ const WorkflowRunParams = Type.Object({
 });
 
 const WorkflowControlParams = Type.Object({
-	action: StringEnum([
-		"list",
-		"status",
-		"wait",
-		"approve",
-		"reject",
-		"stop",
-		"resume",
-	] as const),
+	action: StringEnum(["list", "status", "wait", "stop", "resume"] as const),
 	runId: Type.Optional(Type.String()),
-	gateId: Type.Optional(Type.String()),
 	timeoutMs: Type.Optional(
 		Type.Integer({
 			minimum: 1,
@@ -368,6 +360,10 @@ export default function (pi: ExtensionAPI) {
 	let uiSessionId: string | undefined;
 
 	pi.on("session_start", (_event, ctx) => {
+		pi.events.emit(STATUS_OPTIONS_EVENT, {
+			key: STATUS_KEY,
+			preserveSelectedColors: true,
+		});
 		if (uiSessionId) closeFleet(runtime, uiSessionId);
 		uiSessionId = ctx.sessionManager.getSessionId();
 		runtime.configure(loadConfig(ctx.cwd, ctx.isProjectTrusted()));
@@ -538,8 +534,12 @@ export default function (pi: ExtensionAPI) {
 		renderCall(args, theme) {
 			return renderRunCall(args, theme);
 		},
-		renderResult(result, options, theme) {
-			return renderRunResult(result, options, theme);
+		renderResult(result, options, theme, context) {
+			return renderRunResult(result, options, theme, {
+				lastComponent: context.lastComponent,
+				invalidate: context.invalidate,
+				resolveRun: (runId) => runtime.get(runId),
+			});
 		},
 	});
 
@@ -626,12 +626,12 @@ export default function (pi: ExtensionAPI) {
 		name: "workflow_run",
 		label: "Workflow",
 		description:
-			"Run a named programmatic TypeScript workflow in the foreground or background. Workflows may dynamically fan out to many bounded child agents, join results, and pause at approval gates. Use this instead of manually coordinating large fleets.",
+			"Run a named programmatic TypeScript workflow in the foreground or background. Workflows may dynamically fan out to many bounded child agents and join results. Use this instead of manually coordinating large fleets.",
 		promptSnippet:
 			"Run a bounded programmatic multi-agent workflow in the foreground or background",
 		promptGuidelines: [
-			"Proactively consider workflow_run for repeatable multi-step work, dynamic fan-out, approval gates, or more than four child tasks.",
-			"Set workflow_run background=true for long-running workflows whose result is not needed on the immediate critical path. The launch returns immediately: continue useful independent parent work, or end the turn and rely on the completion or gate notification; use workflow_control status/wait later only when needed, and do not poll.",
+			"Proactively consider workflow_run for repeatable multi-step work, dynamic fan-out, or more than four child tasks.",
+			"Set workflow_run background=true for long-running workflows whose result is not needed on the immediate critical path. The launch returns immediately: continue useful independent parent work, or end the turn and rely on the completion notification; use workflow_control status/wait later only when needed, and do not poll.",
 			"Background workflow_run work survives parent turns, session switches, and extension reloads in the current Pi process, but a full Pi process exit stops it.",
 		],
 		parameters: WorkflowRunParams,
@@ -704,8 +704,6 @@ export default function (pi: ExtensionAPI) {
 					resolveThinking: (model, thinking) =>
 						effectiveThinking(ctx, model, thinking),
 					resolveAgent: (name) => agents.find((agent) => agent.name === name),
-					gateHandler: async (_gateId, gate) =>
-						ctx.hasUI ? ctx.ui.confirm(gate.title, gate.summary) : false,
 					signal: params.background ? undefined : abortController.signal,
 					onCreated: (created) => {
 						parentId = created.id;
@@ -731,8 +729,12 @@ export default function (pi: ExtensionAPI) {
 		renderCall(args, theme) {
 			return renderRunCall(args, theme);
 		},
-		renderResult(result, options, theme) {
-			return renderRunResult(result, options, theme);
+		renderResult(result, options, theme, context) {
+			return renderRunResult(result, options, theme, {
+				lastComponent: context.lastComponent,
+				invalidate: context.invalidate,
+				resolveRun: (runId) => runtime.get(runId),
+			});
 		},
 	});
 
@@ -740,7 +742,7 @@ export default function (pi: ExtensionAPI) {
 		name: "workflow_control",
 		label: "Workflow Control",
 		description:
-			"List, inspect, wait for, approve, reject, stop, or resume programmatic workflow runs.",
+			"List, inspect, wait for, stop, or resume programmatic workflow runs.",
 		parameters: WorkflowControlParams,
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const sessionId = ctx.sessionManager.getSessionId();
@@ -775,7 +777,7 @@ export default function (pi: ExtensionAPI) {
 					? Object.values(snapshot.steps)
 							.map(
 								(step) =>
-									`${step.state === "succeeded" ? "✓" : step.state === "needs_input" ? "?" : step.state === "running" ? "●" : step.state === "queued" ? "◦" : "✗"} ${step.id} (${step.kind}) ${step.state}`,
+									`${step.state === "succeeded" ? "✓" : step.state === "running" ? "●" : step.state === "queued" ? "◦" : "✗"} ${step.id} (${step.kind}) ${step.state}`,
 							)
 							.join("\n")
 					: "(workflow snapshot unavailable)";
@@ -803,27 +805,6 @@ export default function (pi: ExtensionAPI) {
 					observedRuns.delete(pending.id);
 				}
 			}
-			if (params.action === "approve" || params.action === "reject") {
-				if (!params.gateId)
-					throw new Error(`${params.action} requires gateId.`);
-				const run = runtime.getForSession(id, sessionId);
-				if (run?.kind !== "workflow")
-					throw new Error(`Workflow run not found: ${id}`);
-				workflowEngine.approve(
-					run.id,
-					params.gateId,
-					params.action === "approve",
-				);
-				return {
-					content: [
-						{
-							type: "text",
-							text: `${params.action} sent to ${run.id}:${params.gateId}.`,
-						},
-					],
-					details: { runs: [run] },
-				};
-			}
 			if (params.action === "stop") {
 				const pending = runtime.getForSession(id, sessionId);
 				if (pending?.kind !== "workflow")
@@ -837,11 +818,7 @@ export default function (pi: ExtensionAPI) {
 			const previous = runtime.getForSession(id, sessionId);
 			if (previous?.kind !== "workflow")
 				throw new Error(`Workflow run not found: ${id}`);
-			if (
-				!TERMINAL_STATES.has(previous.state) &&
-				previous.state !== "paused" &&
-				previous.state !== "needs_input"
-			)
+			if (!TERMINAL_STATES.has(previous.state) && previous.state !== "paused")
 				throw new Error(
 					`Workflow ${previous.id} is ${previous.state}; it does not need resume.`,
 				);
@@ -1032,8 +1009,6 @@ export default function (pi: ExtensionAPI) {
 					effectiveThinking(ctx, model, thinking),
 				resolveAgent: (agentName) =>
 					agents.find((agent) => agent.name === agentName),
-				gateHandler: async (_gateId, gate) =>
-					ctx.hasUI ? ctx.ui.confirm(gate.title, gate.summary) : false,
 			});
 			ctx.ui.notify(
 				`${record.workflow} ${record.state} [${record.id}]`,
@@ -1064,7 +1039,7 @@ export default function (pi: ExtensionAPI) {
 			const lines = snapshot
 				? Object.values(snapshot.steps).map(
 						(step) =>
-							`${step.state === "succeeded" ? "✓" : step.state === "needs_input" ? "?" : step.state === "running" ? "●" : "◦"} ${step.id} · ${step.state}`,
+							`${step.state === "succeeded" ? "✓" : step.state === "running" ? "●" : "◦"} ${step.id} · ${step.state}`,
 					)
 				: ["(workflow snapshot unavailable)"];
 			ctx.ui.notify(

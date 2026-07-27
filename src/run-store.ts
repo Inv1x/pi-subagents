@@ -175,7 +175,9 @@ export class RunStore {
 		const changed: RunRecord[] = [];
 		for (const record of this.list(1000)) {
 			if (
-				!(["queued", "starting", "running"] as string[]).includes(record.state)
+				!(
+					["queued", "starting", "running", "needs_input"] as string[]
+				).includes(record.state)
 			)
 				continue;
 			const ownerPid =

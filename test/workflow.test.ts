@@ -28,18 +28,7 @@ function definition(filePath: string): AgentDefinition {
 	};
 }
 
-async function waitFor(
-	predicate: () => boolean,
-	timeoutMs = 3000,
-): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (!predicate()) {
-		if (Date.now() >= deadline) throw new Error("condition timed out");
-		await new Promise((resolve) => setTimeout(resolve, 20));
-	}
-}
-
-test("workflow engine fans out, joins, gates, and persists stable steps", async () => {
+test("workflow engine fans out, joins, and persists stable steps", async () => {
 	const directory = fs.mkdtempSync(
 		path.join(os.tmpdir(), "pi-subagents-workflow-"),
 	);
@@ -80,10 +69,6 @@ test("workflow engine fans out, joins, gates, and persists stable steps", async 
 						(item) => ({ agent: "mock", task: item }),
 						{ concurrency: 2 },
 					);
-					await ctx.gate("approval", {
-						title: "approve",
-						summary: first.output,
-					});
 					return { first: first.output, many: many.map((item) => item.output) };
 				},
 			},
@@ -99,26 +84,19 @@ test("workflow engine fans out, joins, gates, and persists stable steps", async 
 				resolveAgent: (name) => (name === "mock" ? agent : undefined),
 			},
 		);
-		await waitFor(() => runtime.get(started.id)?.state === "needs_input");
-		const paused = runtime.store.readWorkflow(started.id);
-		assert.equal(paused?.steps.approval?.state, "needs_input");
+		const completed = await engine.wait(started.id, 5000);
+		const snapshot = runtime.store.readWorkflow(started.id);
 		assert.equal(
-			Object.keys(paused?.steps ?? {}).filter((id) => id.startsWith("many."))
+			Object.keys(snapshot?.steps ?? {}).filter((id) => id.startsWith("many."))
 				.length,
 			2,
 		);
-		engine.approve(started.id, "approval", true);
-		const completed = await engine.wait(started.id, 5000);
 		assert.equal(completed.state, "succeeded");
 		assert.match(completed.output ?? "", /done: Task: first/);
 		assert.equal(
 			runtime.list(100).filter((record) => record.parentRunId === started.id)
 				.length,
 			3,
-		);
-		assert.equal(
-			runtime.store.readWorkflow(started.id)?.steps.approval?.state,
-			"succeeded",
 		);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;

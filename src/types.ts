@@ -8,7 +8,6 @@ export type RunState =
 	| "queued"
 	| "starting"
 	| "running"
-	| "needs_input"
 	| "paused"
 	| "succeeded"
 	| "failed"
@@ -191,7 +190,7 @@ export interface ControlToolDetails {
 
 export interface WorkflowStepRecord {
 	id: string;
-	kind: "agent" | "map" | "gate" | "log";
+	kind: "agent" | "map" | "log";
 	state: RunState;
 	specHash: string;
 	createdAt: number;
