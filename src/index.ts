@@ -595,7 +595,6 @@ export default function (pi: ExtensionAPI) {
 		renderResult(result, options, theme, context) {
 			return renderRunResult(result, options, theme, {
 				lastComponent: context.lastComponent,
-				invalidate: context.invalidate,
 				resolveRun: (runId) => runtime.get(runId),
 			});
 		},
@@ -802,7 +801,6 @@ export default function (pi: ExtensionAPI) {
 		renderResult(result, options, theme, context) {
 			return renderRunResult(result, options, theme, {
 				lastComponent: context.lastComponent,
-				invalidate: context.invalidate,
 				resolveRun: (runId) => runtime.get(runId),
 			});
 		},

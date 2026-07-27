@@ -114,7 +114,7 @@ test("launch and control renderers stay compact", () => {
 	assert.doesNotMatch(rendered, /contextTokens/);
 });
 
-test("running tool rows tick elapsed time and freeze when the run finishes", (context) => {
+test("running tool rows update elapsed time on natural renders without forced ticks", (context) => {
 	context.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1000 });
 	const active = run({
 		createdAt: 0,
@@ -122,51 +122,7 @@ test("running tool rows tick elapsed time and freeze when the run finishes", (co
 		updatedAt: 0,
 	});
 	let current = active;
-	let invalidations = 0;
-	const result = {
-		content: [{ type: "text", text: "running" }],
-		details: { run: active },
-	};
-	const options = { expanded: false, isPartial: false };
-	let component: Component;
-	const invalidate = () => {
-		invalidations++;
-		component = renderRunResult(result, options, theme, {
-			lastComponent: component,
-			invalidate,
-			resolveRun: () => current,
-		});
-	};
-	component = renderRunResult(result, options, theme, {
-		invalidate,
-		resolveRun: () => current,
-	});
-	const render = () => component.render(120).join("\n");
-	assert.match(render(), /running · 1s/);
-
-	context.mock.timers.tick(1000);
-	assert.equal(invalidations, 1);
-	assert.match(render(), /running · 2s/);
-
-	current = {
-		...active,
-		state: "succeeded",
-		endedAt: Date.now(),
-		updatedAt: Date.now(),
-	};
-	context.mock.timers.tick(1000);
-	assert.equal(invalidations, 2);
-	assert.match(render(), /succeeded · 2s/);
-
-	context.mock.timers.tick(5000);
-	assert.equal(invalidations, 2);
-	assert.match(render(), /succeeded · 2s/);
-});
-
-test("detached running tool rows stop their shared elapsed ticker", (context) => {
-	context.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1000 });
-	const active = run({ createdAt: 0, startedAt: 0, updatedAt: 0 });
-	let invalidations = 0;
+	let resolutions = 0;
 	const component = renderRunResult(
 		{
 			content: [{ type: "text", text: "running" }],
@@ -175,20 +131,30 @@ test("detached running tool rows stop their shared elapsed ticker", (context) =>
 		{ expanded: false, isPartial: false },
 		theme,
 		{
-			invalidate: () => {
-				invalidations++;
+			resolveRun: () => {
+				resolutions++;
+				return current;
 			},
-			resolveRun: () => active,
 		},
 	);
-	component.render(120);
+	const render = () => component.render(120).join("\n");
+	assert.match(render(), /running · 1s/);
+	const resolutionsAfterRender = resolutions;
 
 	context.mock.timers.tick(1000);
-	context.mock.timers.tick(1000);
-	assert.equal(invalidations, 2);
-	context.mock.timers.tick(1000);
+	assert.equal(resolutions, resolutionsAfterRender);
+	assert.match(render(), /running · 2s/);
+
+	current = {
+		...active,
+		state: "succeeded",
+		endedAt: Date.now(),
+		updatedAt: Date.now(),
+	};
+	assert.match(render(), /succeeded · 2s/);
+
 	context.mock.timers.tick(5000);
-	assert.equal(invalidations, 2);
+	assert.match(render(), /succeeded · 2s/);
 });
 
 test("count formatting handles singular and plural nouns", () => {

@@ -231,21 +231,15 @@ export function renderRunCall(
 
 type RunRenderLifecycle = {
 	lastComponent?: Component;
-	invalidate?: () => void;
 	resolveRun?: (runId: string) => RunRecord | undefined;
 };
-
-const LIVE_RUN_TICK_MS = 1000;
-const LIVE_RUN_STALE_MS = 2500;
 
 class LiveRunComponent implements Component {
 	private run: RunRecord;
 	private recentActivity: string[] | undefined;
 	private expanded: boolean;
 	private theme: ExtensionContext["ui"]["theme"];
-	private invalidateRow: (() => void) | undefined;
 	private resolveRun: ((runId: string) => RunRecord | undefined) | undefined;
-	private lastRenderedAt = Date.now();
 
 	constructor(
 		run: RunRecord,
@@ -259,8 +253,6 @@ class LiveRunComponent implements Component {
 		this.recentActivity = recentActivity;
 		this.expanded = expanded;
 		this.theme = theme;
-		this.invalidateRow = lifecycle.invalidate;
-		this.syncTicker();
 	}
 
 	update(
@@ -275,30 +267,10 @@ class LiveRunComponent implements Component {
 		this.recentActivity = recentActivity;
 		this.expanded = expanded;
 		this.theme = theme;
-		this.invalidateRow = lifecycle.invalidate;
-		this.syncTicker();
-	}
-
-	private syncTicker(): void {
-		if (TERMINAL_STATES.has(this.run.state) || !this.invalidateRow)
-			unregisterLiveRunComponent(this);
-		else registerLiveRunComponent(this);
-	}
-
-	tick(now: number): void {
-		if (now - this.lastRenderedAt > LIVE_RUN_STALE_MS) {
-			unregisterLiveRunComponent(this);
-			return;
-		}
-		const latest = this.resolveRun?.(this.run.id);
-		if (latest) this.run = latest;
-		this.invalidateRow?.();
-		if (TERMINAL_STATES.has(this.run.state)) unregisterLiveRunComponent(this);
 	}
 
 	render(width: number): string[] {
-		this.lastRenderedAt = Date.now();
-		this.syncTicker();
+		this.run = this.resolveRun?.(this.run.id) ?? this.run;
 		const component = this.expanded
 			? expandedRun(this.run, this.recentActivity, this.theme)
 			: collapsedRun(this.run, this.theme, false);
@@ -306,49 +278,6 @@ class LiveRunComponent implements Component {
 	}
 
 	invalidate(): void {}
-
-	dispose(): void {
-		unregisterLiveRunComponent(this);
-	}
-}
-
-const liveRunRefs = new Set<WeakRef<LiveRunComponent>>();
-const liveRunRegistrations = new WeakMap<
-	LiveRunComponent,
-	WeakRef<LiveRunComponent>
->();
-let liveRunTicker: ReturnType<typeof setInterval> | undefined;
-
-function registerLiveRunComponent(component: LiveRunComponent): void {
-	if (liveRunRegistrations.has(component)) return;
-	const reference = new WeakRef(component);
-	liveRunRegistrations.set(component, reference);
-	liveRunRefs.add(reference);
-	if (liveRunTicker) return;
-	liveRunTicker = setInterval(() => {
-		const now = Date.now();
-		for (const candidate of liveRunRefs) {
-			const live = candidate.deref();
-			if (live) live.tick(now);
-			else liveRunRefs.delete(candidate);
-		}
-		if (!liveRunRefs.size) stopLiveRunTicker();
-	}, LIVE_RUN_TICK_MS);
-	liveRunTicker.unref?.();
-}
-
-function unregisterLiveRunComponent(component: LiveRunComponent): void {
-	const reference = liveRunRegistrations.get(component);
-	if (!reference) return;
-	liveRunRegistrations.delete(component);
-	liveRunRefs.delete(reference);
-	if (!liveRunRefs.size) stopLiveRunTicker();
-}
-
-function stopLiveRunTicker(): void {
-	if (!liveRunTicker) return;
-	clearInterval(liveRunTicker);
-	liveRunTicker = undefined;
 }
 
 export function renderRunResult(
@@ -363,8 +292,6 @@ export function renderRunResult(
 	const details = result.details as SubagentToolDetails | undefined;
 	const run = details?.run;
 	if (!run) {
-		if (lifecycle.lastComponent instanceof LiveRunComponent)
-			lifecycle.lastComponent.dispose();
 		return new Text(
 			result.content.find((part) => part.type === "text")?.text ??
 				"(no output)",
