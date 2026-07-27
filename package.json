@@ -1,6 +1,6 @@
 {
 	"name": "@inv1x/pi-subagents",
-	"version": "0.5.0",
+	"version": "0.6.0",
 	"description": "Focused subagents and durable programmatic workflows for Pi",
 	"type": "module",
 	"license": "MIT",
