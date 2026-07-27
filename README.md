@@ -19,14 +19,14 @@ Focused subagents and bounded programmatic workflows for [Pi](https://github.com
 
 ## Install locally
 
-From this repository:
+From this repository, install the local package persistently so `/reload` can rediscover it:
 
 ```bash
 npm install
-pi -e .
+pi install /absolute/path/to/pi-subagents
 ```
 
-Or add the absolute repository path to Pi's package settings.
+Use `pi -e .` only for a temporary development smoke test. You can also add the absolute repository path to Pi's package settings.
 
 ## Basic usage
 
