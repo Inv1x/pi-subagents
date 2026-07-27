@@ -8,13 +8,18 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { buildChildSystemPrompt, discoverAgents } from "./agents.ts";
 import { loadConfig } from "./config.ts";
+import { THINKING_LEVELS } from "./model-options.ts";
+import { openAgentModelSettings } from "./model-settings.ts";
+import { resolveAgentModelRoute } from "./routing.ts";
 import { getRuntime } from "./runtime.ts";
 import type {
 	AgentDefinition,
 	ContextMode,
+	ExtensionConfig,
 	ResolvedAgentRunRequest,
 	RunRecord,
 	SubagentToolDetails,
+	WorkflowRoutingSnapshot,
 	WorkspaceMode,
 } from "./types.ts";
 import { TERMINAL_STATES } from "./types.ts";
@@ -27,17 +32,10 @@ import {
 	renderRunCall,
 	renderRunResult,
 } from "./ui.ts";
+import type { WorkflowAgentSpec } from "./workflow-api.ts";
 import { discoverWorkflows, getWorkflowEngine } from "./workflows.ts";
 
-const ThinkingSchema = StringEnum([
-	"off",
-	"minimal",
-	"low",
-	"medium",
-	"high",
-	"xhigh",
-	"max",
-] as const);
+const ThinkingSchema = StringEnum(THINKING_LEVELS);
 const ContextSchema = StringEnum(["fresh", "summary"] as const);
 const WorkspaceSchema = StringEnum(["shared", "worktree"] as const);
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -74,11 +72,20 @@ const SubagentRunParams = Type.Object({
 	context: Type.Optional(ContextSchema),
 	model: Type.Optional(
 		Type.String({
+			minLength: 1,
 			description:
-				"Exact provider/model override. Omit this to inherit the parent's current model; never invent a model name.",
+				"Exact provider/model override. Omit to use difficulty-based agent profiles, then agent/parent defaults; never invent a model name.",
 		}),
 	),
 	thinking: Type.Optional(ThinkingSchema),
+	difficulty: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: 5,
+			description:
+				"Head-agent estimate of task difficulty: 1 trivial, 2 light, 3 standard, 4 complex, 5 critical. Defaults to 3 and selects a configured model profile.",
+		}),
+	),
 	cwd: Type.Optional(
 		Type.String({
 			description:
@@ -274,6 +281,7 @@ function resolveRequest(
 		context?: ContextMode;
 		model?: string;
 		thinking?: ResolvedAgentRunRequest["thinking"];
+		difficulty?: number;
 		cwd?: string;
 		workspace?: WorkspaceMode;
 		timeoutMs?: number;
@@ -283,18 +291,25 @@ function resolveRequest(
 	definition: AgentDefinition,
 	ctx: ExtensionContext,
 	parentThinking: ResolvedAgentRunRequest["thinking"],
+	config: ExtensionConfig,
 ): ResolvedAgentRunRequest {
 	const context = params.context ?? definition.context;
 	const contextText = context === "summary" ? parentSummary(ctx) : "";
 	const task = contextText
 		? `${params.task}\n\n<parent_context>\n${contextText}\n</parent_context>`
 		: params.task;
-	const model = canonicalModelSpec(ctx, params.model ?? definition.model);
-	const thinking = effectiveThinking(
-		ctx,
-		model,
-		params.thinking ?? definition.thinking ?? parentThinking,
-	);
+	const route = resolveAgentModelRoute({
+		difficulty: params.difficulty,
+		model: params.model,
+		thinking: params.thinking,
+		profiles: config.agentModels[definition.name],
+		definitionModel: definition.model,
+		definitionThinking: definition.thinking,
+		parentModel: selectedModel(ctx),
+		parentThinking,
+	});
+	const model = canonicalModelSpec(ctx, route.model);
+	const thinking = effectiveThinking(ctx, model, route.thinking);
 	const timeoutMs = params.timeoutMs ?? definition.timeoutMs;
 	const maxTurns = params.maxTurns ?? definition.maxTurns;
 	const systemPrompt = buildChildSystemPrompt(definition, {
@@ -307,6 +322,8 @@ function resolveRequest(
 		baseAgent: params.agent === definition.name ? undefined : definition.name,
 		task,
 		definition,
+		difficulty: route.difficulty,
+		profileMaxDifficulty: route.profile?.maxDifficulty,
 		background: params.background ?? false,
 		context,
 		model,
@@ -320,6 +337,44 @@ function resolveRequest(
 	};
 }
 
+function createWorkflowRouting(
+	config: ExtensionConfig,
+	agents: readonly AgentDefinition[],
+	ctx: ExtensionContext,
+	parentThinking: ResolvedAgentRunRequest["thinking"],
+): WorkflowRoutingSnapshot {
+	return {
+		defaultModel: selectedModel(ctx),
+		defaultThinking: parentThinking,
+		agentModels: config.agentModels,
+		agents: Object.fromEntries(agents.map((agent) => [agent.name, agent])),
+	};
+}
+
+function resolveWorkflowAgentRoute(
+	definition: AgentDefinition,
+	spec: WorkflowAgentSpec,
+	ctx: ExtensionContext,
+	routing: WorkflowRoutingSnapshot,
+) {
+	const route = resolveAgentModelRoute({
+		difficulty: spec.difficulty,
+		model: spec.model,
+		thinking: spec.thinking,
+		profiles: routing.agentModels[definition.name],
+		definitionModel: definition.model,
+		definitionThinking: definition.thinking,
+		parentModel: routing.defaultModel,
+		parentThinking: routing.defaultThinking,
+	});
+	const model = canonicalModelSpec(ctx, route.model);
+	return {
+		...route,
+		model,
+		thinking: effectiveThinking(ctx, model, route.thinking),
+	};
+}
+
 function formatRun(record: RunRecord): string {
 	const name = record.agent ?? record.workflow ?? record.kind;
 	const attempts =
@@ -330,6 +385,7 @@ function formatRun(record: RunRecord): string {
 		attempts,
 		record.model ? shortModel(record.model) : undefined,
 		record.thinking ? `${record.thinking} effort` : undefined,
+		record.difficulty ? `difficulty ${record.difficulty}/5` : undefined,
 		record.usage.cost ? `$${record.usage.cost.toFixed(4)}` : undefined,
 	].filter((part): part is string => Boolean(part));
 	const details = selection.length ? ` · ${selection.join(" · ")}` : "";
@@ -413,7 +469,7 @@ export default function (pi: ExtensionAPI) {
 			.map((agent) => `- ${agent.name}: ${agent.description}`)
 			.join("\n");
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n<available_subagents>\nGive each subagent_run a concise descriptive agent name. To specialize it, set baseAgent to one of these exact definitions:\n${catalog || "- (none)"}\nIf baseAgent is omitted, an agent name matching a definition uses that definition; otherwise it uses general. Omit subagent_run.model unless the user explicitly requests an exact provider/model override. When omitted, the child inherits ${selectedModel(ctx) ?? "the parent model"}. Omit maxTurns and timeoutMs unless the user requests hard ceilings; built-in defaults support long-running work.\n</available_subagents>`,
+			systemPrompt: `${event.systemPrompt}\n\n<available_subagents>\nGive each subagent_run a concise descriptive agent name. To specialize it, set baseAgent to one of these exact definitions:\n${catalog || "- (none)"}\nIf baseAgent is omitted, an agent name matching a definition uses that definition; otherwise it uses general. Estimate difficulty for every child: 1 trivial, 2 light/focused, 3 standard, 4 complex or risky, 5 critical/high-uncertainty. Omit model and thinking unless the user explicitly requests overrides; configured profiles route by difficulty, then agent/parent defaults apply (${selectedModel(ctx) ?? "parent model"} currently selected). Omit maxTurns and timeoutMs unless the user requests hard ceilings; built-in defaults support long-running work.\n</available_subagents>`,
 		};
 	});
 
@@ -426,7 +482,8 @@ export default function (pi: ExtensionAPI) {
 			"Run one isolated specialist child in the foreground or background; multiple sibling calls run concurrently",
 		promptGuidelines: [
 			"Give subagent_run agent a concise task-specific name. Set baseAgent to an exact discovered role when its specialization helps; omit baseAgent to use an exact agent-name match or the general fallback.",
-			"Omit subagent_run model by default so the child inherits the parent's current provider/model; never invent a model override.",
+			"Set subagent_run difficulty from 1 (trivial) to 5 (critical) for every child. Use 3 for ordinary work; do not inflate routine tasks.",
+			"Omit subagent_run model and thinking by default so configured difficulty profiles can route the child, then agent/parent defaults can apply; never invent a model override.",
 			"Omit subagent_run maxTurns and timeoutMs unless the user explicitly requests a hard cap. Built-in agents already allow 128 turns and one hour; low ad hoc caps can terminate broad investigations before they produce a handoff.",
 			"Proactively consider subagent_run when context isolation, independent review, specialization, or real parallelism would improve the result enough to justify child startup cost.",
 			"For independent parallel tasks, issue multiple subagent_run calls in the same assistant message; do not call them sequentially.",
@@ -484,6 +541,7 @@ export default function (pi: ExtensionAPI) {
 				definition,
 				ctx,
 				pi.getThinkingLevel(),
+				config,
 			);
 			let activeRunId: string | undefined;
 			const unsubscribe = runtime.subscribe((update) => {
@@ -694,15 +752,27 @@ export default function (pi: ExtensionAPI) {
 				);
 			if (signal?.aborted) abort();
 			else signal?.addEventListener("abort", abort, { once: true });
+			const routing = createWorkflowRouting(
+				config,
+				agents,
+				ctx,
+				pi.getThinkingLevel(),
+			);
 			try {
 				const record = await workflowEngine.start(workflow, params.input, {
 					cwd: ctx.cwd,
 					sessionId: ctx.sessionManager.getSessionId(),
 					background: params.background ?? false,
-					defaultModel: selectedModel(ctx),
-					defaultThinking: pi.getThinkingLevel(),
-					resolveThinking: (model, thinking) =>
-						effectiveThinking(ctx, model, thinking),
+					defaultModel: routing.defaultModel,
+					defaultThinking: routing.defaultThinking,
+					routing,
+					resolveAgentRoute: (definition, spec, pinnedRouting) =>
+						resolveWorkflowAgentRoute(
+							definition,
+							spec,
+							ctx,
+							pinnedRouting ?? routing,
+						),
 					resolveAgent: (name) => agents.find((agent) => agent.name === name),
 					signal: params.background ? undefined : abortController.signal,
 					onCreated: (created) => {
@@ -818,9 +888,13 @@ export default function (pi: ExtensionAPI) {
 			const previous = runtime.getForSession(id, sessionId);
 			if (previous?.kind !== "workflow")
 				throw new Error(`Workflow run not found: ${id}`);
-			if (!TERMINAL_STATES.has(previous.state) && previous.state !== "paused")
+			if (
+				previous.state !== "failed" &&
+				previous.state !== "orphaned" &&
+				previous.state !== "paused"
+			)
 				throw new Error(
-					`Workflow ${previous.id} is ${previous.state}; it does not need resume.`,
+					`Workflow ${previous.id} is ${previous.state}; only failed, orphaned, or paused workflows can resume.`,
 				);
 			const workflows = await discoverWorkflows(
 				ctx.cwd,
@@ -833,21 +907,35 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(
 					`Workflow definition no longer exists: ${previous.workflow}`,
 				);
+			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+			runtime.configure(config);
 			const agents = discoverAgents({
 				cwd: ctx.cwd,
 				projectTrusted: ctx.isProjectTrusted(),
 				scope: ctx.isProjectTrusted() ? "both" : "user",
-				config: loadConfig(ctx.cwd, ctx.isProjectTrusted()),
+				config,
 			});
 			const snapshot = runtime.store.readWorkflow(previous.id);
+			const routing = createWorkflowRouting(
+				config,
+				agents,
+				ctx,
+				pi.getThinkingLevel(),
+			);
 			const resumed = await workflowEngine.start(workflow, snapshot?.input, {
 				cwd: previous.cwd,
 				sessionId: ctx.sessionManager.getSessionId(),
 				background: true,
-				defaultModel: selectedModel(ctx),
-				defaultThinking: pi.getThinkingLevel(),
-				resolveThinking: (model, thinking) =>
-					effectiveThinking(ctx, model, thinking),
+				defaultModel: routing.defaultModel,
+				defaultThinking: routing.defaultThinking,
+				routing,
+				resolveAgentRoute: (definition, spec, pinnedRouting) =>
+					resolveWorkflowAgentRoute(
+						definition,
+						spec,
+						ctx,
+						pinnedRouting ?? routing,
+					),
 				resolveAgent: (name) => agents.find((agent) => agent.name === name),
 				existingRunId: previous.id,
 			});
@@ -864,8 +952,32 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("subagent-models", {
+		description:
+			"Configure difficulty-based model profiles for each agent type",
+		handler: async (args, ctx) => {
+			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+			const agents = discoverAgents({
+				cwd: ctx.cwd,
+				projectTrusted: ctx.isProjectTrusted(),
+				scope: ctx.isProjectTrusted() ? "both" : "user",
+				config,
+			});
+			try {
+				if (await openAgentModelSettings(ctx, agents, args)) {
+					runtime.configure(loadConfig(ctx.cwd, ctx.isProjectTrusted()));
+				}
+			} catch (error) {
+				ctx.ui.notify(
+					error instanceof Error ? error.message : String(error),
+					"error",
+				);
+			}
+		},
+	});
+
 	pi.registerCommand("subagents", {
-		description: "List available subagents",
+		description: "List available subagents and model profiles",
 		handler: async (_args, ctx) => {
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
 			const agents = discoverAgents({
@@ -879,6 +991,16 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(
 				agents
 					.map((agent) => {
+						const profiles = config.agentModels[agent.name];
+						if (profiles?.length) {
+							const ladder = profiles
+								.map(
+									(profile) =>
+										`≤${profile.maxDifficulty} ${shortModel(profile.model)} ${profile.thinking}`,
+								)
+								.join(" → ");
+							return `${agent.name} [${agent.source}] · ${ladder} — ${agent.description}`;
+						}
 						const modelSpec = agent.model ?? parentModel;
 						const model = shortModel(modelSpec);
 						const effort = effectiveThinking(
@@ -886,7 +1008,7 @@ export default function (pi: ExtensionAPI) {
 							modelSpec,
 							agent.thinking ?? parentThinking,
 						);
-						return `${agent.name} [${agent.source}] · ${model} · ${effort} effort — ${agent.description}`;
+						return `${agent.name} [${agent.source}] · ${model} · ${effort} effort (default) — ${agent.description}`;
 					})
 					.join("\n") || "No agents found.",
 				"info",
@@ -999,14 +1121,26 @@ export default function (pi: ExtensionAPI) {
 				scope: ctx.isProjectTrusted() ? "both" : "user",
 				config,
 			});
+			const routing = createWorkflowRouting(
+				config,
+				agents,
+				ctx,
+				pi.getThinkingLevel(),
+			);
 			const record = await workflowEngine.start(workflow, input, {
 				cwd: ctx.cwd,
 				sessionId: ctx.sessionManager.getSessionId(),
 				background,
-				defaultModel: selectedModel(ctx),
-				defaultThinking: pi.getThinkingLevel(),
-				resolveThinking: (model, thinking) =>
-					effectiveThinking(ctx, model, thinking),
+				defaultModel: routing.defaultModel,
+				defaultThinking: routing.defaultThinking,
+				routing,
+				resolveAgentRoute: (definition, spec, pinnedRouting) =>
+					resolveWorkflowAgentRoute(
+						definition,
+						spec,
+						ctx,
+						pinnedRouting ?? routing,
+					),
 				resolveAgent: (agentName) =>
 					agents.find((agent) => agent.name === agentName),
 			});
@@ -1069,6 +1203,7 @@ export default function (pi: ExtensionAPI) {
 			const lines = [
 				`Project trusted: ${ctx.isProjectTrusted() ? "yes" : "no"}`,
 				`Agents: ${agents.length} (${agents.map((agent) => agent.name).join(", ")})`,
+				`Model profiles: ${Object.values(config.agentModels).reduce((total, profiles) => total + profiles.length, 0)} across ${Object.keys(config.agentModels).length} agent types`,
 				`Workflows: ${workflows.length} (${workflows.map((workflow) => workflow.definition.name).join(", ")})`,
 				`Scheduler: ${runtime.scheduler.activeCount} active, ${runtime.scheduler.queuedCount} queued, limit ${config.maxConcurrency}`,
 				`Retries: ${config.maxRetries} process-level, ${config.retryBaseDelayMs} ms base delay`,
@@ -1076,11 +1211,30 @@ export default function (pi: ExtensionAPI) {
 				`Orphaned runs: ${stale}`,
 				`Pi executable: ${process.execPath}`,
 			];
+			await ctx.modelRegistry.refresh();
+			const availableModels = new Set(
+				ctx.modelRegistry
+					.getAvailable()
+					.map((model) => `${model.provider}/${model.id}`),
+			);
+			const unavailableProfiles = Object.entries(config.agentModels).flatMap(
+				([agent, profiles]) =>
+					profiles
+						.filter((profile) => !availableModels.has(profile.model))
+						.map((profile) => `${agent}: ${profile.model}`),
+			);
+			if (unavailableProfiles.length)
+				lines.push(
+					`Warning: unavailable configured models: ${unavailableProfiles.join(", ")}`,
+				);
 			if (agents.some((agent) => agent.skills.length))
 				lines.push(
 					"Warning: agent frontmatter skills are parsed but explicit child skill-path loading is not implemented yet.",
 				);
-			ctx.ui.notify(lines.join("\n"), stale ? "warning" : "info");
+			ctx.ui.notify(
+				lines.join("\n"),
+				stale || unavailableProfiles.length ? "warning" : "info",
+			);
 		},
 	});
 }

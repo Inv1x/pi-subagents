@@ -278,6 +278,7 @@ export class SubagentRuntime {
 			workspace: request.workspace,
 			model: request.model ?? request.definition.model,
 			thinking: request.thinking ?? request.definition.thinking,
+			difficulty: request.difficulty,
 			createdAt,
 			updatedAt: createdAt,
 			usage: {
@@ -295,6 +296,10 @@ export class SubagentRuntime {
 				context: request.context,
 				requestedModel: request.model ?? request.definition.model,
 				requestedThinking: request.thinking ?? request.definition.thinking,
+				difficulty: request.difficulty,
+				...(request.profileMaxDifficulty
+					? { profileMaxDifficulty: request.profileMaxDifficulty }
+					: {}),
 				maxTurns: request.maxTurns,
 				timeoutMs: request.timeoutMs,
 				writeCapable: isWriteCapable(request.definition),

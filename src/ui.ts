@@ -959,6 +959,9 @@ class FleetComponent implements Component {
 					...(childSummary ? [detail("Progress", childSummary)] : []),
 					detail("Model", modelLabel(run.model) ?? "inherit"),
 					detail("Effort", run.thinking ? `${run.thinking} effort` : "inherit"),
+					...(run.difficulty
+						? [detail("Difficulty", String(run.difficulty))]
+						: []),
 					detail("Usage", usageLine(run) || "-"),
 					detail("Activity", run.activity?.message ?? "-"),
 					detail("Cwd", run.cwd),

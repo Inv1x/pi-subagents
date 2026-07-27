@@ -83,6 +83,7 @@ export default defineWorkflow({
       areas,
       (area) => ({
         agent: "reviewer",
+        difficulty: 3,
         task: `Review ${area} for: ${input.request}`,
       }),
       { concurrency: 3 },
@@ -92,7 +93,7 @@ export default defineWorkflow({
 });
 ```
 
-Stable IDs (`reviews`, `plan`, `implement`, and so on) are part of the durability contract. On resume, completed steps with the same normalized specification are reused. A changed specification produces a workflow-drift error rather than silently repeating side effects. Agent-step results include the actual model, thinking effort, usage, cost, and artifact paths.
+Stable IDs (`reviews`, `plan`, `implement`, and so on) are part of the durability contract. On resume, completed steps with the same normalized specification are reused. A changed specification produces a workflow-drift error rather than silently repeating side effects. Agent-step specs can set `difficulty: 1 | 2 | 3 | 4 | 5` for model routing; omitted difficulty defaults to `3`. Results include the actual model, thinking effort, usage, cost, and artifact paths.
 
 Workflow context methods:
 
@@ -141,15 +142,26 @@ Supported frontmatter:
 
 Discovery precedence is built-in, user, then trusted project. Project definitions override the same agent name.
 
-## Model and effort selection
+## Difficulty-based model and effort selection
 
-Every child gets an explicit model and thinking effort. Selection precedence is:
+Each child has a difficulty from `1` to `5`:
 
-1. `subagent_run` or workflow-step override
-2. Agent frontmatter (`model`, `thinking`)
-3. The parent Pi session's currently selected model and thinking level
+- `1`: trivial
+- `2`: light or narrowly focused
+- `3`: standard work (the default)
+- `4`: complex or risky
+- `5`: critical or high-uncertainty
 
-`model: inherit` therefore follows the live parent selection rather than merely falling back to global defaults. The extension passes the resolved values through Pi's `--model` and `--thinking` flags, then records the actual provider/model reported by the child alongside tokens, cost, and effort in the durable run status.
+The head agent estimates this value for standalone calls; workflow authors set it on each agent step. Configure an ordered threshold ladder per resolved agent type—including `general`—with `/subagent-models` or the `agentModels` setting. The extension selects the profile with the smallest `maxDifficulty` that covers the request. If no threshold covers it, the highest configured threshold is the strongest fallback.
+
+Model and thinking fields resolve independently in this order:
+
+1. Explicit `subagent_run` or workflow-step `model` / `thinking` override
+2. The selected difficulty profile
+3. Agent frontmatter (`model`, `thinking`)
+4. The parent Pi session's current model and thinking level
+
+With no configured ladder, behavior remains the same as before. `model: inherit` follows the live parent selection. The extension passes resolved values through Pi's `--model` and `--thinking` flags, then records the difficulty, requested model/effort, and actual provider/model reported by the child in durable run status.
 
 Compact run rows show the selected model and effort for that individual run. The fleet status intentionally omits a single model because concurrent children can use different configurations. Expanded output and `/subagents-fleet` retain the full model and usage details.
 
@@ -163,7 +175,7 @@ Children run with `--no-session` because this package owns their durable artifac
 
 Runs one child. `agent` is a descriptive run name such as `task-auditor`. Set `baseAgent` to an exact discovered definition such as `reviewer` to inherit its prompt, tools, and defaults. If `baseAgent` is omitted, an exact `agent` match is used; otherwise the child falls back to `general`.
 
-Omit `model` to inherit the parent's current provider/model; overrides must be exact provider/model identifiers.
+Set `difficulty` from `1` to `5` and normally omit `model` and `thinking` so the configured profile ladder can route the child. Explicit model overrides must be exact provider/model identifiers.
 
 ```text
 Run task-auditor based on reviewer to inspect the current task implementation.
@@ -174,7 +186,7 @@ Important options:
 - `baseAgent`
 - `background`
 - `context`
-- `model`, `thinking`
+- `model`, `thinking`, `difficulty` (defaults to `3`)
 - `cwd`
 - `workspace`
 - `timeoutMs`, `maxTurns`, `maxRetries`
@@ -199,6 +211,7 @@ Actions: `list`, `status`, `wait`, `stop`, `resume`.
 ## Commands
 
 - `/subagents`
+- `/subagent-models [agent]`
 - `/subagents-fleet`
 - `/subagents-stop [runId]`
 - `/workflows`
@@ -214,6 +227,27 @@ Trusted project override: `.pi/pi-subagents.json`
 
 ```json
 {
+  "agentModels": {
+    "general": [
+      {
+        "model": "openai-codex/gpt-5.6-sol",
+        "thinking": "low",
+        "maxDifficulty": 2
+      },
+      {
+        "model": "openai-codex/gpt-5.6-sol",
+        "thinking": "high",
+        "maxDifficulty": 5
+      }
+    ],
+    "scout": [
+      {
+        "model": "openai-codex/gpt-5.6-sol",
+        "thinking": "medium",
+        "maxDifficulty": 5
+      }
+    ]
+  },
   "maxConcurrency": 4,
   "maxWorkflowConcurrency": 4,
   "maxFanout": 16,
@@ -231,6 +265,8 @@ Trusted project override: `.pi/pi-subagents.json`
   "confirmProjectWorkflows": true
 }
 ```
+
+Agent profile keys use the resolved agent definition name, not a descriptive run name. Project arrays replace user arrays for the same agent while leaving other user agent ladders intact. An explicit empty array disables routing for that agent. `/subagent-models` provides searchable model/agent pickers, can save either user settings or trusted-project settings, can remove a project override to resume user-level inheritance, and preserves unrelated configuration fields.
 
 ## Write safety and worktrees
 

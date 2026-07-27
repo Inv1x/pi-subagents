@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ContextMode, WorkspaceMode } from "./types.ts";
+import type { ContextMode, Difficulty, WorkspaceMode } from "./types.ts";
 
 export interface WorkflowAgentSpec {
 	agent: string;
@@ -7,6 +7,8 @@ export interface WorkflowAgentSpec {
 	context?: ContextMode;
 	model?: string;
 	thinking?: ThinkingLevel;
+	/** Head/workflow estimate from 1 (trivial) to 5 (critical). Defaults to 3. */
+	difficulty?: Difficulty;
 	cwd?: string;
 	workspace?: WorkspaceMode;
 	timeoutMs?: number;

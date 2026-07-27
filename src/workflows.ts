@@ -7,6 +7,11 @@ import { createJiti } from "jiti";
 import { buildChildSystemPrompt } from "./agents.ts";
 import { observe } from "./observation.ts";
 import { truncateUtf8 } from "./protocol.ts";
+import {
+	type AgentModelRoute,
+	resolveAgentModelRoute,
+	resolveDifficulty,
+} from "./routing.ts";
 import type { SubagentRuntime } from "./runtime.ts";
 import type {
 	AgentDefinition,
@@ -14,6 +19,7 @@ import type {
 	RunError,
 	RunRecord,
 	RunState,
+	WorkflowRoutingSnapshot,
 	WorkflowSnapshot,
 	WorkflowStepRecord,
 } from "./types.ts";
@@ -136,6 +142,12 @@ interface WorkflowExecutionOptions {
 		model: string | undefined,
 		thinking: ResolvedAgentRunRequest["thinking"],
 	) => ResolvedAgentRunRequest["thinking"];
+	routing?: WorkflowRoutingSnapshot;
+	resolveAgentRoute?: (
+		definition: AgentDefinition,
+		spec: WorkflowAgentSpec,
+		routing: WorkflowRoutingSnapshot | undefined,
+	) => AgentModelRoute;
 	resolveAgent: (name: string) => AgentDefinition | undefined;
 	signal?: AbortSignal;
 	onCreated?: (record: RunRecord) => void;
@@ -173,6 +185,47 @@ function stepError(error: unknown): RunError {
 		message: error instanceof Error ? error.message : String(error),
 		retryable: true,
 	};
+}
+
+function validateAgentSpec(spec: WorkflowAgentSpec): void {
+	if (!spec || typeof spec !== "object")
+		throw new Error("Workflow agent specification must be an object.");
+	if (typeof spec.agent !== "string" || !spec.agent.trim())
+		throw new Error("Workflow agent name must be a non-empty string.");
+	if (typeof spec.task !== "string" || !spec.task.trim())
+		throw new Error("Workflow agent task must be a non-empty string.");
+	if (
+		spec.context !== undefined &&
+		!["fresh", "summary"].includes(spec.context)
+	)
+		throw new Error(`Invalid workflow context '${String(spec.context)}'.`);
+	if (
+		spec.workspace !== undefined &&
+		!["shared", "worktree"].includes(spec.workspace)
+	)
+		throw new Error(`Invalid workflow workspace '${String(spec.workspace)}'.`);
+	if (spec.cwd !== undefined && typeof spec.cwd !== "string")
+		throw new Error("Workflow agent cwd must be a string.");
+	for (const [name, value] of [
+		["timeoutMs", spec.timeoutMs],
+		["maxTurns", spec.maxTurns],
+	] as const) {
+		if (
+			value !== undefined &&
+			(!Number.isInteger(value) || (value as number) <= 0)
+		)
+			throw new Error(`Workflow ${name} must be a positive integer.`);
+	}
+}
+
+function validateMapOptions(options: WorkflowMapOptions): void {
+	if (
+		options.concurrency !== undefined &&
+		(!Number.isInteger(options.concurrency) || options.concurrency <= 0)
+	)
+		throw new Error("Workflow map concurrency must be a positive integer.");
+	if (options.failFast !== undefined && typeof options.failFast !== "boolean")
+		throw new Error("Workflow map failFast must be a boolean.");
 }
 
 export class WorkflowEngine {
@@ -220,6 +273,7 @@ export class WorkflowEngine {
 				input,
 				definitionPath: workflow.filePath,
 				definitionHash: workflow.definitionHash,
+				routing: options.routing,
 				state: "queued",
 				createdAt: record.createdAt,
 				updatedAt: record.updatedAt,
@@ -319,6 +373,7 @@ export class WorkflowEngine {
 		): Promise<WorkflowAgentResult> => {
 			if (controller.signal.aborted)
 				throw controller.signal.reason ?? new Error("Workflow cancelled");
+			validateAgentSpec(spec);
 			assertNodeBudget(stepId);
 			const specHash = hash(spec);
 			const existing = snapshot.steps[stepId];
@@ -330,8 +385,35 @@ export class WorkflowEngine {
 				if (existing.state === "succeeded")
 					return existing.result as WorkflowAgentResult;
 			}
-			const definition = options.resolveAgent(spec.agent);
+			const routing = snapshot.routing ?? options.routing;
+			const definition =
+				routing?.agents[spec.agent] ?? options.resolveAgent(spec.agent);
 			if (!definition) throw new Error(`Unknown workflow agent: ${spec.agent}`);
+			const savedRoute = existing?.metadata?.route as
+				| AgentModelRoute
+				| undefined;
+			const route =
+				savedRoute ??
+				options.resolveAgentRoute?.(definition, spec, routing) ??
+				resolveAgentModelRoute({
+					difficulty: spec.difficulty,
+					model: spec.model,
+					thinking: spec.thinking,
+					profiles: routing?.agentModels[definition.name],
+					definitionModel: definition.model,
+					definitionThinking: definition.thinking,
+					parentModel: routing?.defaultModel ?? options.defaultModel,
+					parentThinking: routing?.defaultThinking ?? options.defaultThinking,
+				});
+			const model = route.model;
+			const thinking =
+				options.resolveThinking?.(model, route.thinking) ?? route.thinking;
+			const persistedRoute: AgentModelRoute = {
+				difficulty: resolveDifficulty(route.difficulty),
+				model,
+				thinking,
+				...(route.profile ? { profile: route.profile } : {}),
+			};
 			const step: WorkflowStepRecord = {
 				id: stepId,
 				kind: "agent",
@@ -339,18 +421,21 @@ export class WorkflowEngine {
 				specHash,
 				createdAt: existing?.createdAt ?? Date.now(),
 				updatedAt: Date.now(),
-				metadata: { agent: spec.agent, task: spec.task },
+				metadata: {
+					agent: spec.agent,
+					task: spec.task,
+					route: persistedRoute,
+				},
 			};
 			persistStep(step);
-			const model = spec.model ?? definition.model ?? options.defaultModel;
-			const requestedThinking =
-				spec.thinking ?? definition.thinking ?? options.defaultThinking;
 			const timeoutMs = spec.timeoutMs ?? definition.timeoutMs;
 			const maxTurns = spec.maxTurns ?? definition.maxTurns;
 			const request: ResolvedAgentRunRequest = {
 				agent: definition.name,
 				task: spec.task,
 				definition,
+				difficulty: persistedRoute.difficulty,
+				profileMaxDifficulty: persistedRoute.profile?.maxDifficulty,
 				background: false,
 				context: spec.context ?? definition.context,
 				cwd: spec.cwd ? path.resolve(options.cwd, spec.cwd) : options.cwd,
@@ -362,9 +447,7 @@ export class WorkflowEngine {
 					timeoutMs,
 				}),
 				model,
-				thinking:
-					options.resolveThinking?.(model, requestedThinking) ??
-					requestedThinking,
+				thinking,
 			};
 			try {
 				const child = await this.runtime.startAgent(request, {
@@ -431,6 +514,7 @@ export class WorkflowEngine {
 			factory: (item: T, index: number) => WorkflowAgentSpec,
 			mapOptions: WorkflowMapOptions = {},
 		): Promise<WorkflowAgentResult[]> {
+			validateMapOptions(mapOptions);
 			const maxFanout = Math.min(
 				workflowEngine.runtime.getConfig().maxFanout,
 				workflowEngine.runtime.getConfig().hardMaxFanout,

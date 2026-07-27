@@ -19,10 +19,12 @@ export default defineWorkflow({
 		const request = requestOf(input);
 		const context = await ctx.agent("scout", {
 			agent: "scout",
+			difficulty: 2,
 			task: `Inspect the repository for this request and return a compact implementation handoff:\n\n${request}`,
 		});
 		const plan = await ctx.agent("plan", {
 			agent: "planner",
+			difficulty: 4,
 			task: `Create an implementation plan for the request below. Use the scout evidence, verify details in the repository, and do not edit files.\n\nRequest:\n${request}\n\nScout evidence:\n${context.output}`,
 		});
 		return plan.output;

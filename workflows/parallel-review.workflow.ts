@@ -29,6 +29,7 @@ export default defineWorkflow({
 			focuses,
 			(focus) => ({
 				agent: "reviewer",
+				difficulty: 3,
 				task: `Review the implementation related to this request, focusing on ${focus}. Inspect current repository files, do not edit, and report only actionable findings with evidence.\n\nRequest:\n${request}`,
 			}),
 			{ concurrency: 3 },

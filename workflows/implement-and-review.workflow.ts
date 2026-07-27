@@ -21,14 +21,17 @@ export default defineWorkflow({
 		const request = requestOf(input);
 		const context = await ctx.agent("scout", {
 			agent: "scout",
+			difficulty: 3,
 			task: `Map the code relevant to this implementation request. Do not edit.\n\n${request}`,
 		});
 		const plan = await ctx.agent("plan", {
 			agent: "planner",
+			difficulty: 4,
 			task: `Produce a concrete implementation plan.\n\nRequest:\n${request}\n\nCode context:\n${context.output}`,
 		});
 		const implementation = await ctx.agent("implement", {
 			agent: "worker",
+			difficulty: 4,
 			task: `Implement this request and validate it.\n\nRequest:\n${request}\n\nPlan:\n${plan.output}`,
 		});
 		const focuses = [
@@ -41,6 +44,7 @@ export default defineWorkflow({
 			focuses,
 			(focus) => ({
 				agent: "reviewer",
+				difficulty: 3,
 				task: `Review the current implementation for ${focus}. Do not edit files.\n\nOriginal request:\n${request}\n\nImplementation report:\n${implementation.output}`,
 			}),
 			{ concurrency: 3 },
@@ -50,6 +54,7 @@ export default defineWorkflow({
 			.join("\n\n");
 		const final = await ctx.agent("fix-review-findings", {
 			agent: "worker",
+			difficulty: 4,
 			task: `Inspect these independent review reports. Apply only valid findings, keep the implementation in scope, and run focused validation.\n\nOriginal request:\n${request}\n\nReview reports:\n${findings}`,
 		});
 		return final.output;

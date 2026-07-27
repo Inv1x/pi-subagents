@@ -4,6 +4,14 @@ export type AgentSource = "builtin" | "package" | "user" | "project";
 export type ContextMode = "fresh" | "summary";
 export type WorkspaceMode = "shared" | "worktree";
 export type RunKind = "agent" | "workflow";
+export type Difficulty = 1 | 2 | 3 | 4 | 5;
+
+export interface AgentModelProfile {
+	model: string;
+	thinking: ThinkingLevel;
+	maxDifficulty: Difficulty;
+}
+
 export type RunState =
 	| "queued"
 	| "starting"
@@ -80,6 +88,7 @@ export interface RunRecord {
 	workspace: WorkspaceMode;
 	model?: string;
 	thinking?: ThinkingLevel;
+	difficulty?: Difficulty;
 	createdAt: number;
 	startedAt?: number;
 	endedAt?: number;
@@ -115,6 +124,7 @@ export interface AgentRunRequest {
 	context?: ContextMode;
 	model?: string;
 	thinking?: ThinkingLevel;
+	difficulty?: Difficulty;
 	cwd?: string;
 	workspace?: WorkspaceMode;
 	timeoutMs?: number;
@@ -126,6 +136,8 @@ export interface AgentRunRequest {
 
 export interface ResolvedAgentRunRequest extends AgentRunRequest {
 	definition: AgentDefinition;
+	difficulty: Difficulty;
+	profileMaxDifficulty?: Difficulty;
 	background: boolean;
 	context: ContextMode;
 	cwd: string;
@@ -162,6 +174,7 @@ export interface TransportResult {
 }
 
 export interface ExtensionConfig {
+	agentModels: Record<string, AgentModelProfile[]>;
 	maxConcurrency: number;
 	maxWorkflowConcurrency: number;
 	maxFanout: number;
@@ -201,6 +214,13 @@ export interface WorkflowStepRecord {
 	metadata?: Record<string, unknown>;
 }
 
+export interface WorkflowRoutingSnapshot {
+	defaultModel?: string;
+	defaultThinking?: ThinkingLevel;
+	agentModels: Record<string, AgentModelProfile[]>;
+	agents: Record<string, AgentDefinition>;
+}
+
 export interface WorkflowSnapshot {
 	version: 1;
 	runId: string;
@@ -208,6 +228,7 @@ export interface WorkflowSnapshot {
 	input: unknown;
 	definitionPath?: string;
 	definitionHash: string;
+	routing?: WorkflowRoutingSnapshot;
 	state: RunState;
 	createdAt: number;
 	updatedAt: number;

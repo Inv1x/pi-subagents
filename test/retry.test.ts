@@ -31,6 +31,7 @@ function request(agent: AgentDefinition): ResolvedAgentRunRequest {
 		agent: agent.name,
 		task: "retry test",
 		definition: agent,
+		difficulty: 3,
 		background: false,
 		context: "fresh",
 		cwd: path.dirname(agent.filePath),

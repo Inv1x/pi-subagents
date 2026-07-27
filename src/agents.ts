@@ -1,12 +1,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
 	CONFIG_DIR_NAME,
 	getAgentDir,
 	parseFrontmatter,
 } from "@earendil-works/pi-coding-agent";
+import { isThinkingLevel } from "./model-options.ts";
 import type {
 	AgentDefinition,
 	AgentSource,
@@ -19,16 +19,6 @@ const PACKAGE_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
 	"..",
 );
-const THINKING_LEVELS = new Set([
-	"off",
-	"minimal",
-	"low",
-	"medium",
-	"high",
-	"xhigh",
-	"max",
-]);
-
 interface RawFrontmatter extends Record<string, unknown> {
 	name?: unknown;
 	description?: unknown;
@@ -101,11 +91,9 @@ function parseAgentFile(
 		frontmatter.context === "summary" ? "summary" : "fresh";
 	const workspace: WorkspaceMode =
 		frontmatter.workspace === "worktree" ? "worktree" : "shared";
-	const thinking =
-		typeof frontmatter.thinking === "string" &&
-		THINKING_LEVELS.has(frontmatter.thinking)
-			? (frontmatter.thinking as ThinkingLevel)
-			: undefined;
+	const thinking = isThinkingLevel(frontmatter.thinking)
+		? frontmatter.thinking
+		: undefined;
 	return {
 		name: frontmatter.name,
 		description: frontmatter.description.trim(),
