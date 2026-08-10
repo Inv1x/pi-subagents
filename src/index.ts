@@ -223,43 +223,72 @@ function textFromMessage(message: unknown): string {
 	return text ? `${candidate.role}: ${text}` : "";
 }
 
-function parentSummary(ctx: ExtensionContext, maxChars = 12_000): string {
-	const lines: string[] = [];
-	for (const entry of ctx.sessionManager.getBranch()) {
+export function parentSummary(
+	ctx: ExtensionContext,
+	maxChars = 12_000,
+): string {
+	const summaries: string[] = [];
+	const messages: string[] = [];
+	for (const entry of ctx.sessionManager.buildContextEntries()) {
+		if (entry.type === "compaction" && entry.summary) {
+			summaries.push(`[Compaction summary]\n${entry.summary}`);
+			continue;
+		}
+		if (entry.type === "branch_summary" && entry.summary) {
+			summaries.push(`[Branch summary]\n${entry.summary}`);
+			continue;
+		}
 		if (entry.type !== "message") continue;
 		const text = textFromMessage(entry.message);
-		if (text) lines.push(text);
+		if (text) messages.push(text);
 	}
-	let result = lines.slice(-20).join("\n\n");
-	if (result.length > maxChars)
-		result = `[Earlier parent context omitted]\n${result.slice(-maxChars)}`;
-	return result;
+	const summaryText = summaries.join("\n\n");
+	const messageText = messages.slice(-20).join("\n\n");
+	const result = [summaryText, messageText].filter(Boolean).join("\n\n");
+	if (maxChars <= 0) return "";
+	if (result.length <= maxChars) return result;
+	if (!summaryText) return messageText.slice(-maxChars);
+	if (!messageText) return summaryText.slice(0, maxChars);
+
+	// Reserve room for both compacted history and the latest retained messages.
+	const summaryBudget = Math.max(0, Math.floor((maxChars - 2) / 2));
+	const boundedSummary = summaryText.slice(0, summaryBudget);
+	const messageBudget = Math.max(0, maxChars - boundedSummary.length - 2);
+	const boundedMessage = messageBudget ? messageText.slice(-messageBudget) : "";
+	return [boundedSummary, boundedMessage].filter(Boolean).join("\n\n");
 }
 
 function selectedModel(ctx: ExtensionContext): string | undefined {
 	return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 }
 
-function canonicalModelSpec(
+function currentModelScope(
+	ctx: ExtensionContext,
+): readonly string[] | undefined {
+	return ctx.scopedModels.length > 0
+		? ctx.scopedModels.map(({ model }) => `${model.provider}/${model.id}`)
+		: undefined;
+}
+
+export function canonicalModelSpec(
 	ctx: ExtensionContext,
 	requested: string | undefined,
-	pinnedScope: readonly string[] | undefined = ctx.scopedModels.length > 0
-		? ctx.scopedModels.map(({ model }) => `${model.provider}/${model.id}`)
-		: undefined,
+	pinnedScope: readonly string[] | undefined,
 ): string | undefined {
-	if (!requested) return selectedModel(ctx);
+	const candidate = requested;
+	if (candidate === undefined) return undefined;
 	const allowed = pinnedScope ? new Set(pinnedScope) : undefined;
-	const separator = requested.indexOf("/");
+	const separator = candidate.indexOf("/");
 	if (separator > 0) {
-		const provider = requested.slice(0, separator);
-		const modelId = requested.slice(separator + 1);
+		const provider = candidate.slice(0, separator);
+		const modelId = candidate.slice(separator + 1);
 		if (
 			ctx.modelRegistry.find(provider, modelId) &&
-			(!allowed || allowed.has(requested))
+			(!allowed || allowed.has(candidate))
 		)
-			return requested;
+			return candidate;
 		throw new Error(
-			`Child model '${requested}' is unknown or outside the current scopedModels selection.`,
+			`Child model '${candidate}' is unknown or outside the pinned scopedModels selection.`,
 		);
 	}
 	const candidates = allowed
@@ -272,7 +301,7 @@ function canonicalModelSpec(
 				return found ? [found] : [];
 			})
 		: ctx.modelRegistry.getAvailable();
-	const matches = candidates.filter((model) => model.id === requested);
+	const matches = candidates.filter((model) => model.id === candidate);
 	const currentProviderMatch = matches.find(
 		(model) => model.provider === ctx.model?.provider,
 	);
@@ -281,10 +310,10 @@ function canonicalModelSpec(
 	if (match) return `${match.provider}/${match.id}`;
 	if (matches.length > 1)
 		throw new Error(
-			`Ambiguous child model '${requested}'. Use an exact provider/model identifier.`,
+			`Ambiguous child model '${candidate}'. Use an exact provider/model identifier.`,
 		);
 	throw new Error(
-		`Unknown child model '${requested}'. Use an exact available provider/model identifier.`,
+		`Unknown child model '${candidate}'. Use an exact available provider/model identifier.`,
 	);
 }
 
@@ -296,10 +325,10 @@ function effectiveThinking(
 	ctx: ExtensionContext,
 	modelSpec: string | undefined,
 	thinking: ResolvedAgentRunRequest["thinking"],
+	fallbackToCurrentModel: boolean,
 ): ResolvedAgentRunRequest["thinking"] {
 	if (!thinking) return undefined;
-	let model =
-		!modelSpec || modelSpec === selectedModel(ctx) ? ctx.model : undefined;
+	let model = fallbackToCurrentModel && !modelSpec ? ctx.model : undefined;
 	if (modelSpec) {
 		const separator = modelSpec.indexOf("/");
 		if (separator > 0)
@@ -348,8 +377,12 @@ function resolveRequest(
 		parentModel: selectedModel(ctx),
 		parentThinking,
 	});
-	const model = canonicalModelSpec(ctx, route.model);
-	const thinking = effectiveThinking(ctx, model, route.thinking);
+	const model = canonicalModelSpec(
+		ctx,
+		route.model ?? selectedModel(ctx),
+		currentModelScope(ctx),
+	);
+	const thinking = effectiveThinking(ctx, model, route.thinking, true);
 	const timeoutMs = params.timeoutMs ?? definition.timeoutMs;
 	const maxTurns = params.maxTurns ?? definition.maxTurns;
 	const systemPrompt = buildChildSystemPrompt(definition, {
@@ -423,8 +456,20 @@ function resolveWorkflowAgentRoute(
 	return {
 		...route,
 		model,
-		thinking: effectiveThinking(ctx, model, route.thinking),
+		thinking: effectiveThinking(ctx, model, route.thinking, false),
 	};
+}
+
+function validateWorkflowAgentRoute(
+	route: ReturnType<typeof resolveAgentModelRoute>,
+	ctx: ExtensionContext,
+	routing: WorkflowRoutingSnapshot,
+) {
+	const model =
+		route.model === undefined
+			? undefined
+			: canonicalModelSpec(ctx, route.model, routing.scopedModels);
+	return { ...route, model };
 }
 
 function formatRun(record: RunRecord): string {
@@ -664,11 +709,15 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(
 					`Unknown base agent '${requestedBase}'. Available: ${agents.map((agent) => agent.name).join(", ") || "none"}.`,
 				);
-			if (
+			const requiresProjectAgentConfirmation =
 				definition.source === "project" &&
-				(params.confirmProjectAgent ?? config.confirmProjectAgents) &&
-				ctx.hasUI
-			) {
+				(params.confirmProjectAgent ?? config.confirmProjectAgents);
+			if (requiresProjectAgentConfirmation && !ctx.hasUI) {
+				throw new Error(
+					"Project-local agent execution requires an interactive confirmation.",
+				);
+			}
+			if (requiresProjectAgentConfirmation) {
 				const approved = await ctx.ui.confirm(
 					"Run project-local agent?",
 					`${definition.name}\n${definition.description}\n\nSource: ${definition.filePath}\n\nProject prompts are repository-controlled.`,
@@ -859,12 +908,12 @@ export default function (pi: ExtensionAPI) {
 				params.preview === true ||
 				workflow.source === "project" ||
 				(projectAgents.length > 0 && config.confirmProjectAgents);
-			if (workflow.source === "project" && shouldPreview && !ctx.hasUI) {
+			if (shouldPreview && !ctx.hasUI) {
 				throw new Error(
-					"Project workflow execution requires an interactive launch confirmation.",
+					"Workflow execution requires an interactive launch confirmation because it includes project-controlled code or prompts.",
 				);
 			}
-			if (shouldPreview && ctx.hasUI) {
+			if (shouldPreview) {
 				const details = [
 					`${workflow.definition.name}: ${workflow.definition.description}`,
 					`Source: ${workflow.filePath}`,
@@ -923,6 +972,8 @@ export default function (pi: ExtensionAPI) {
 								ctx,
 								pinnedRouting ?? routing,
 							),
+						validateAgentRoute: (route, pinnedRouting) =>
+							validateWorkflowAgentRoute(route, ctx, pinnedRouting ?? routing),
 						resolveAgent: (name) => agents.find((agent) => agent.name === name),
 						signal: params.background ? undefined : abortController.signal,
 						onCreated: (created) => {
@@ -1066,21 +1117,42 @@ export default function (pi: ExtensionAPI) {
 				scope: ctx.isProjectTrusted() ? "both" : "user",
 				config,
 			});
-			if (workflow.source === "project") {
-				if (!ctx.hasUI)
-					throw new Error(
-						"Project workflow resume requires an interactive confirmation.",
-					);
-				if (
-					!(await ctx.ui.confirm(
-						"Resume project workflow?",
-						`${workflow.definition.name}: ${workflow.definition.description}\nSource: ${workflow.filePath}`,
-					))
-				)
-					throw new Error("Workflow resume was not approved.");
-			}
-			const executableWorkflow = await loadWorkflowForExecution(workflow);
 			const snapshot = runtime.store.readWorkflow(previous.id);
+			const projectAgents = [
+				...agents,
+				...Object.values(snapshot?.routing?.agents ?? {}),
+			].filter(
+				(agent, index, all) =>
+					agent.source === "project" &&
+					all.findIndex(
+						(candidate) => candidate.filePath === agent.filePath,
+					) === index,
+			);
+			const requiresResumeConfirmation =
+				workflow.source === "project" ||
+				(projectAgents.length > 0 && config.confirmProjectAgents);
+			if (requiresResumeConfirmation && !ctx.hasUI) {
+				throw new Error(
+					"Workflow resume requires an interactive confirmation because it includes project-controlled code or prompts.",
+				);
+			}
+			if (
+				requiresResumeConfirmation &&
+				!(await ctx.ui.confirm(
+					"Resume workflow?",
+					[
+						`${workflow.definition.name}: ${workflow.definition.description}`,
+						`Source: ${workflow.filePath}`,
+						projectAgents.length
+							? `Project agent overrides: ${projectAgents.map((agent) => agent.name).join(", ")}`
+							: undefined,
+					]
+						.filter((line): line is string => Boolean(line))
+						.join("\n"),
+				))
+			)
+				throw new Error("Workflow resume was not approved.");
+			const executableWorkflow = await loadWorkflowForExecution(workflow);
 			const routing = createWorkflowRouting(
 				config,
 				agents,
@@ -1106,6 +1178,8 @@ export default function (pi: ExtensionAPI) {
 							ctx,
 							pinnedRouting ?? routing,
 						),
+					validateAgentRoute: (route, pinnedRouting) =>
+						validateWorkflowAgentRoute(route, ctx, pinnedRouting ?? routing),
 					resolveAgent: (name) => agents.find((agent) => agent.name === name),
 					existingRunId: previous.id,
 				},
@@ -1178,6 +1252,7 @@ export default function (pi: ExtensionAPI) {
 							ctx,
 							modelSpec,
 							agent.thinking ?? parentThinking,
+							true,
 						);
 						return `${agent.name} [${agent.source}] · ${model} · ${effort} effort (default) — ${agent.description}`;
 					})
@@ -1276,29 +1351,42 @@ export default function (pi: ExtensionAPI) {
 			);
 			if (!workflow)
 				return ctx.ui.notify(`Unknown workflow '${name}'.`, "error");
-			if (workflow.source === "project" && !ctx.hasUI) {
-				return ctx.ui.notify(
-					"Project workflow execution requires an interactive launch confirmation.",
-					"error",
-				);
-			}
-			if (
-				(workflow.source === "project" || config.confirmProjectWorkflows) &&
-				ctx.hasUI
-			) {
-				const approved = await ctx.ui.confirm(
-					"Launch workflow?",
-					`${workflow.definition.name}: ${workflow.definition.description}\nSource: ${workflow.filePath}\nMode: ${background ? "background" : "foreground"}`,
-				);
-				if (!approved) return;
-			}
-			const executableWorkflow = await loadWorkflowForExecution(workflow);
 			const agents = discoverAgents({
 				cwd: ctx.cwd,
 				projectTrusted: ctx.isProjectTrusted(),
 				scope: ctx.isProjectTrusted() ? "both" : "user",
 				config,
 			});
+			const projectAgents = agents.filter(
+				(agent) => agent.source === "project",
+			);
+			const requiresConfirmation =
+				workflow.source === "project" ||
+				config.confirmProjectWorkflows ||
+				(projectAgents.length > 0 && config.confirmProjectAgents);
+			if (requiresConfirmation && !ctx.hasUI) {
+				return ctx.ui.notify(
+					"Workflow execution requires an interactive launch confirmation because it includes a configured preview or project-controlled code or prompts.",
+					"error",
+				);
+			}
+			if (requiresConfirmation) {
+				const approved = await ctx.ui.confirm(
+					"Launch workflow?",
+					[
+						`${workflow.definition.name}: ${workflow.definition.description}`,
+						`Source: ${workflow.filePath}`,
+						`Mode: ${background ? "background" : "foreground"}`,
+						projectAgents.length
+							? `Project agent overrides: ${projectAgents.map((agent) => agent.name).join(", ")}`
+							: undefined,
+					]
+						.filter((line): line is string => Boolean(line))
+						.join("\n"),
+				);
+				if (!approved) return;
+			}
+			const executableWorkflow = await loadWorkflowForExecution(workflow);
 			const routing = createWorkflowRouting(
 				config,
 				agents,
@@ -1321,6 +1409,8 @@ export default function (pi: ExtensionAPI) {
 						ctx,
 						pinnedRouting ?? routing,
 					),
+				validateAgentRoute: (route, pinnedRouting) =>
+					validateWorkflowAgentRoute(route, ctx, pinnedRouting ?? routing),
 				resolveAgent: (agentName) =>
 					agents.find((agent) => agent.name === agentName),
 			});

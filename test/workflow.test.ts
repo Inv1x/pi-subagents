@@ -207,6 +207,7 @@ test("workflow resume keeps the original routing snapshot", async () => {
 		);
 		assert.equal(failed.state, "failed");
 
+		let validatedSavedRoutes = 0;
 		const resumed = await engine.start(
 			workflow,
 			{},
@@ -221,10 +222,17 @@ test("workflow resume keeps the original routing snapshot", async () => {
 					agents: { mock: { ...agent, model: "new/model" } },
 				},
 				resolveAgentRoute: (_definition, _spec, routing) => route(routing),
+				validateAgentRoute: (savedRoute, routing) => {
+					validatedSavedRoutes++;
+					assert.deepEqual(routing?.scopedModels, ["old/model"]);
+					assert.equal(savedRoute.model, "old/model");
+					return savedRoute;
+				},
 				resolveAgent: (name) => (name === "mock" ? agent : undefined),
 			},
 		);
 		assert.equal(resumed.state, "succeeded");
+		assert.equal(validatedSavedRoutes, 1);
 		assert.equal(
 			runtime.store.readWorkflow(resumed.id)?.routing?.defaultModel,
 			"old/model",
@@ -240,6 +248,84 @@ test("workflow resume keeps the original routing snapshot", async () => {
 				.map((record) => record.model),
 			["old/model", "old/model"],
 		);
+	} finally {
+		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
+		else process.env.PI_SUBAGENTS_PI_BIN = previous;
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("workflow fallback preserves undefined defaults from pinned routing", async () => {
+	const directory = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-subagents-workflow-undefined-route-"),
+	);
+	const script = path.join(directory, "mock-pi.mjs");
+	fs.writeFileSync(
+		script,
+		`#!/usr/bin/env node\nif(process.argv.includes('--model')||process.argv.includes('--thinking')) process.exit(2);\nconsole.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'unpinned default'}],usage:{input:1,output:1,cost:{total:0}},provider:'mock',model:'default',stopReason:'stop',timestamp:Date.now()}}));\nconsole.log(JSON.stringify({type:'agent_settled'}));\n`,
+	);
+	fs.chmodSync(script, 0o755);
+	const previous = process.env.PI_SUBAGENTS_PI_BIN;
+	process.env.PI_SUBAGENTS_PI_BIN = script;
+	try {
+		const runtime = new SubagentRuntime(
+			new RunStore(path.join(directory, "runs")),
+		);
+		const engine = new WorkflowEngine(runtime);
+		const agent = definition(script);
+		const workflow: DiscoveredWorkflow = {
+			source: "user",
+			filePath: path.join(directory, "undefined.workflow.ts"),
+			definitionHash: "undefined-route-hash",
+			definition: {
+				name: "undefined-route",
+				description: "test",
+				async run(ctx) {
+					return (await ctx.agent("only", { agent: "mock", task: "test" }))
+						.output;
+				},
+			},
+		};
+		const completed = await engine.start(
+			workflow,
+			{},
+			{
+				cwd: directory,
+				background: false,
+				defaultModel: "current/model",
+				defaultThinking: "high",
+				routing: {
+					defaultModel: undefined,
+					defaultThinking: undefined,
+					agentModels: {},
+					agents: { mock: agent },
+				},
+				resolveAgent: (name) => (name === "mock" ? agent : undefined),
+			},
+		);
+		assert.equal(completed.state, "succeeded");
+		const route = runtime.store.readWorkflow(completed.id)?.steps.only?.metadata
+			?.route as { model?: string; thinking?: string } | undefined;
+		assert.equal(route?.model, undefined);
+		assert.equal(route?.thinking, undefined);
+
+		const outsideScope = await engine.start(
+			workflow,
+			{},
+			{
+				cwd: directory,
+				background: false,
+				routing: {
+					defaultModel: "outside/model",
+					scopedModels: ["allowed/model"],
+					agentModels: {},
+					agents: { mock: agent },
+				},
+				resolveAgent: (name) => (name === "mock" ? agent : undefined),
+			},
+		);
+		assert.equal(outsideScope.state, "failed");
+		assert.match(outsideScope.error?.message ?? "", /outside the pinned/);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
 		else process.env.PI_SUBAGENTS_PI_BIN = previous;

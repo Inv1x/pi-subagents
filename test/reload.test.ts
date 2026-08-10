@@ -13,6 +13,8 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import extension from "../src/index.ts";
+import { getRuntime } from "../src/runtime.ts";
+import { getWorkflowEngine, WorkflowEngine } from "../src/workflows.ts";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 const expectedTools = [
@@ -66,6 +68,32 @@ test("closed compatible tools prefer provider-supported strict sampling", () => 
 		undefined,
 		"unconstrained workflow input is not strict-schema compatible",
 	);
+});
+
+test("workflow engine adopts the current prototype without losing active state", () => {
+	const engine = getWorkflowEngine(getRuntime());
+	const state = engine as unknown as {
+		active: Map<string, unknown>;
+	};
+	const active = state.active;
+	const sentinel = {
+		controller: new AbortController(),
+		promise: new Promise(() => {}),
+	};
+	active.set("reload-sentinel", sentinel);
+	try {
+		Object.setPrototypeOf(engine, { legacy: true });
+		const adopted = getWorkflowEngine(getRuntime());
+		assert.equal(adopted, engine);
+		assert.equal(Object.getPrototypeOf(adopted), WorkflowEngine.prototype);
+		assert.equal(
+			(adopted as unknown as { active: Map<string, unknown> }).active,
+			active,
+		);
+		assert.equal(active.get("reload-sentinel"), sentinel);
+	} finally {
+		active.delete("reload-sentinel");
+	}
 });
 
 test("package tools remain registered and active after reload", async () => {

@@ -11,6 +11,8 @@ import type {
 	UsageStats,
 } from "./types.ts";
 
+export const MAX_LIVE_TEXT_SLOTS = 256;
+
 function emptyUsage(): UsageStats {
 	return {
 		turns: 0,
@@ -219,7 +221,35 @@ export async function runCliAgent(
 	let sawSettled = false;
 	let settlementHadFinal = false;
 	const liveText = new Map<number, string>();
+	const liveIndexes: number[] = [];
+	let liveBytes = 0;
 	let liveTruncated = false;
+
+	const insertLiveIndex = (index: number) => {
+		let low = 0;
+		let high = liveIndexes.length;
+		while (low < high) {
+			const middle = (low + high) >>> 1;
+			if ((liveIndexes[middle] ?? 0) < index) low = middle + 1;
+			else high = middle;
+		}
+		liveIndexes.splice(low, 0, index);
+	};
+	const emitLivePreview = () => {
+		const combined = liveIndexes
+			.map((index) => liveText.get(index) ?? "")
+			.join("\n");
+		options.onEvent?.({
+			type: "assistant",
+			data: {
+				text: liveTruncated
+					? `${combined}\n\n[Live output truncated; message_end remains authoritative.]`
+					: combined,
+				partial: true,
+				truncated: liveTruncated,
+			},
+		});
+	};
 
 	const remember = (line: string) => {
 		transcript.push(line);
@@ -261,6 +291,8 @@ export async function runCliAgent(
 				const type = typeof event.type === "string" ? event.type : "unknown";
 				if (type === "message_start") {
 					liveText.clear();
+					liveIndexes.length = 0;
+					liveBytes = 0;
 					liveTruncated = false;
 				}
 				if (
@@ -274,42 +306,46 @@ export async function runCliAgent(
 					>;
 					if (
 						deltaEvent.type === "text_delta" &&
-						typeof deltaEvent.contentIndex === "number" &&
+						Number.isSafeInteger(deltaEvent.contentIndex) &&
+						(deltaEvent.contentIndex as number) >= 0 &&
 						typeof deltaEvent.delta === "string" &&
+						deltaEvent.delta.length > 0 &&
 						!liveTruncated
 					) {
-						const index = deltaEvent.contentIndex;
-						const retainedBytes =
-							[...liveText.values()].reduce(
-								(total, text) => total + Buffer.byteLength(text),
+						const index = deltaEvent.contentIndex as number;
+						const existing = liveText.get(index);
+						if (
+							existing === undefined &&
+							liveText.size >= MAX_LIVE_TEXT_SLOTS
+						) {
+							liveTruncated = true;
+							emitLivePreview();
+						} else {
+							const separatorBytes =
+								existing === undefined && liveText.size > 0 ? 1 : 0;
+							const remaining = Math.max(
 								0,
-							) +
-							Math.max(0, liveText.size - 1) +
-							(!liveText.has(index) && liveText.size > 0 ? 1 : 0);
-						const remaining = Math.max(
-							0,
-							options.resultMaxBytes - retainedBytes,
-						);
-						const boundedDelta = truncateUtf8(deltaEvent.delta, remaining);
-						const retainedDelta = boundedDelta.truncated
-							? boundedDelta.text.split("\n\n[Output truncated:", 1)[0]
-							: boundedDelta.text;
-						liveText.set(index, `${liveText.get(index) ?? ""}${retainedDelta}`);
-						liveTruncated = boundedDelta.truncated;
-						const combined = [...liveText.entries()]
-							.sort(([left], [right]) => left - right)
-							.map(([, text]) => text)
-							.join("\n");
-						options.onEvent?.({
-							type: "assistant",
-							data: {
-								text: liveTruncated
-									? `${combined}\n\n[Live output truncated; message_end remains authoritative.]`
-									: combined,
-								partial: true,
-								truncated: liveTruncated,
-							},
-						});
+								options.resultMaxBytes - liveBytes - separatorBytes,
+							);
+							const boundedDelta = truncateUtf8(deltaEvent.delta, remaining);
+							const retainedDelta = boundedDelta.truncated
+								? boundedDelta.text.slice(
+										0,
+										boundedDelta.text.lastIndexOf("\n\n[Output truncated:"),
+									)
+								: boundedDelta.text;
+							if (retainedDelta) {
+								if (existing === undefined) {
+									insertLiveIndex(index);
+									liveText.set(index, retainedDelta);
+								} else {
+									liveText.set(index, `${existing}${retainedDelta}`);
+								}
+								liveBytes += separatorBytes + Buffer.byteLength(retainedDelta);
+							}
+							liveTruncated = boundedDelta.truncated;
+							if (retainedDelta || liveTruncated) emitLivePreview();
+						}
 					}
 				}
 				if (type === "tool_execution_start") {

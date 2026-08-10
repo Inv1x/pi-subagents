@@ -239,6 +239,10 @@ interface WorkflowExecutionOptions {
 		spec: WorkflowAgentSpec,
 		routing: WorkflowRoutingSnapshot | undefined,
 	) => AgentModelRoute;
+	validateAgentRoute?: (
+		route: AgentModelRoute,
+		routing: WorkflowRoutingSnapshot | undefined,
+	) => AgentModelRoute;
 	resolveAgent: (name: string) => AgentDefinition | undefined;
 	signal?: AbortSignal;
 	onCreated?: (record: RunRecord) => void;
@@ -539,7 +543,9 @@ export class WorkflowEngine {
 				| AgentModelRoute
 				| undefined;
 			const route =
-				savedRoute ??
+				(savedRoute
+					? (options.validateAgentRoute?.(savedRoute, routing) ?? savedRoute)
+					: undefined) ??
 				options.resolveAgentRoute?.(definition, spec, routing) ??
 				resolveAgentModelRoute({
 					difficulty: spec.difficulty,
@@ -548,9 +554,20 @@ export class WorkflowEngine {
 					profiles: routing?.agentModels[definition.name],
 					definitionModel: definition.model,
 					definitionThinking: definition.thinking,
-					parentModel: routing?.defaultModel ?? options.defaultModel,
-					parentThinking: routing?.defaultThinking ?? options.defaultThinking,
+					parentModel: routing ? routing.defaultModel : options.defaultModel,
+					parentThinking: routing
+						? routing.defaultThinking
+						: options.defaultThinking,
 				});
+			if (
+				route.model !== undefined &&
+				routing?.scopedModels !== undefined &&
+				!routing.scopedModels.includes(route.model)
+			) {
+				throw new Error(
+					`Workflow model route '${route.model}' is outside the pinned scopedModels selection.`,
+				);
+			}
 			const model = route.model;
 			const thinking =
 				options.resolveThinking?.(model, route.thinking) ?? route.thinking;
@@ -844,5 +861,8 @@ export function getWorkflowEngine(runtime: SubagentRuntime): WorkflowEngine {
 		[ENGINE_SYMBOL]?: WorkflowEngine;
 	};
 	globals[ENGINE_SYMBOL] ??= new WorkflowEngine(runtime);
+	// Keep active workflows and their abort controllers across hot reloads while
+	// adopting fixes and new methods from the current module instance.
+	Object.setPrototypeOf(globals[ENGINE_SYMBOL], WorkflowEngine.prototype);
 	return globals[ENGINE_SYMBOL];
 }

@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { runCliAgent } from "../src/transport.ts";
+import { MAX_LIVE_TEXT_SLOTS, runCliAgent } from "../src/transport.ts";
 import type { AgentDefinition, ResolvedAgentRunRequest } from "../src/types.ts";
 
 function agent(filePath: string): AgentDefinition {
@@ -22,6 +22,76 @@ function agent(filePath: string): AgentDefinition {
 		source: "user",
 		filePath,
 	};
+}
+
+async function runDeltaEvents(
+	events: unknown[],
+	resultMaxBytes: number,
+): Promise<{ partials: string[]; output: string | undefined }> {
+	const directory = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-subagents-delta-events-"),
+	);
+	const script = path.join(directory, "mock-pi.mjs");
+	const jsonl = `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
+	fs.writeFileSync(
+		script,
+		`#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(jsonl)});\n`,
+	);
+	fs.chmodSync(script, 0o755);
+	const previous = process.env.PI_SUBAGENTS_PI_BIN;
+	process.env.PI_SUBAGENTS_PI_BIN = script;
+	try {
+		const definition = agent(script);
+		const partials: string[] = [];
+		const result = await runCliAgent({
+			runId: "agent_delta_events",
+			runDirectory: directory,
+			request: {
+				agent: definition.name,
+				task: "test",
+				definition,
+				difficulty: 3,
+				background: false,
+				context: "fresh",
+				cwd: directory,
+				workspace: "shared",
+				timeoutMs: 5000,
+				maxTurns: 3,
+				systemPrompt: "mock",
+			},
+			signal: new AbortController().signal,
+			resultMaxBytes,
+			transcriptMaxEvents: 20,
+			onEvent: (event) => {
+				if (event.type === "assistant" && event.data?.partial === true)
+					partials.push(String(event.data.text));
+			},
+		});
+		assert.equal(result.state, "succeeded");
+		return { partials, output: result.output };
+	} finally {
+		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
+		else process.env.PI_SUBAGENTS_PI_BIN = previous;
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+}
+
+function finalEvents(): unknown[] {
+	return [
+		{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "Authoritative final" }],
+				usage: { input: 1, output: 1, cost: { total: 0 } },
+				provider: "fixture",
+				model: "model",
+				stopReason: "stop",
+				timestamp: 0,
+			},
+		},
+		{ type: "agent_settled" },
+	];
 }
 
 test("CLI transport parses events, activity, usage, and output", async () => {
@@ -125,6 +195,77 @@ test("CLI transport assembles Pi 0.84 delta-only updates but trusts message_end"
 		else process.env.PI_SUBAGENTS_PI_BIN = previous;
 		fs.rmSync(directory, { recursive: true, force: true });
 	}
+});
+
+test("CLI transport bounds and validates sparse delta slots", async () => {
+	const events: unknown[] = [
+		{ type: "message_start", message: { role: "assistant", content: [] } },
+		...Array.from({ length: 300 }, (_, contentIndex) => ({
+			type: "message_update",
+			assistantMessageEvent: { type: "text_delta", contentIndex, delta: "" },
+		})),
+		...[-1, 1.5, Number.MAX_SAFE_INTEGER + 1].map((contentIndex) => ({
+			type: "message_update",
+			assistantMessageEvent: {
+				type: "text_delta",
+				contentIndex,
+				delta: "invalid",
+			},
+		})),
+		...Array.from({ length: MAX_LIVE_TEXT_SLOTS }, (_, offset) => {
+			const contentIndex = MAX_LIVE_TEXT_SLOTS - offset - 1;
+			return {
+				type: "message_update",
+				assistantMessageEvent: {
+					type: "text_delta",
+					contentIndex,
+					delta: String(contentIndex),
+				},
+			};
+		}),
+		{
+			type: "message_update",
+			assistantMessageEvent: {
+				type: "text_delta",
+				contentIndex: MAX_LIVE_TEXT_SLOTS,
+				delta: "overflow",
+			},
+		},
+		...finalEvents(),
+	];
+	const { partials, output } = await runDeltaEvents(events, 16 * 1024);
+	assert.equal(output, "Authoritative final");
+	const final = partials.at(-1) ?? "";
+	assert.match(final, /Live output truncated/);
+	const retained = final.split("\n\n[Live output truncated", 1)[0] ?? "";
+	const slots = retained.split("\n");
+	assert.equal(slots.length, MAX_LIVE_TEXT_SLOTS);
+	assert.equal(slots[0], "0");
+	assert.equal(slots.at(-1), String(MAX_LIVE_TEXT_SLOTS - 1));
+	assert.equal(retained.includes("invalid"), false);
+});
+
+test("CLI transport applies the live byte cap incrementally at UTF-8 boundaries", async () => {
+	const events = [
+		{ type: "message_start", message: { role: "assistant", content: [] } },
+		{
+			type: "message_update",
+			assistantMessageEvent: {
+				type: "text_delta",
+				contentIndex: 0,
+				delta: "ééé",
+			},
+		},
+		...finalEvents(),
+	];
+	const { partials } = await runDeltaEvents(events, 3);
+	const final = partials.at(-1) ?? "";
+	assert.match(final, /Live output truncated/);
+	assert.equal(final.split("\n\n[Live output truncated", 1)[0], "é");
+	assert.ok(
+		Buffer.byteLength(final.split("\n\n[Live output truncated", 1)[0] ?? "") <=
+			3,
+	);
 });
 
 test("CLI transport rejects zero exits without complete settlement", async () => {
