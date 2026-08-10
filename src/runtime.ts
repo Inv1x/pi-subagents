@@ -702,6 +702,19 @@ export class SubagentRuntime {
 			});
 			return;
 		}
+		if (
+			event.type === "assistant" &&
+			event.data?.partial === true &&
+			typeof event.data.text === "string"
+		) {
+			const tail = event.data.text.replace(/\s+/g, " ").trim().slice(-160);
+			if (tail) {
+				this.patch(record, {
+					activity: { message: `responding: ${tail}`, updatedAt: now() },
+				});
+			}
+			return;
+		}
 		if (event.type === "usage" && event.data) {
 			this.patch(record, {
 				usage: {

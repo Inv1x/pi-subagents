@@ -1,4 +1,10 @@
+import { Type } from "typebox";
 import { defineWorkflow } from "../src/workflow-api.ts";
+
+const RequestInput = Type.Union([
+	Type.String(),
+	Type.Object({ request: Type.String() }, { additionalProperties: false }),
+]);
 
 function requestOf(input: unknown): string {
 	if (typeof input === "string") return input;
@@ -15,10 +21,13 @@ export default defineWorkflow({
 	name: "scout-plan",
 	description:
 		"Inspect relevant code, then produce a grounded implementation plan.",
+	input: RequestInput,
+	output: Type.String(),
 	async run(ctx, input: unknown) {
 		const request = requestOf(input);
 		const context = await ctx.agent("scout", {
 			agent: "scout",
+			context: "summary",
 			difficulty: 2,
 			task: `Inspect the repository for this request and return a compact implementation handoff:\n\n${request}`,
 		});

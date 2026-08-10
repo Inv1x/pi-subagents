@@ -1,4 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { TSchema } from "typebox";
 import type { ContextMode, Difficulty, WorkspaceMode } from "./types.ts";
 
 export interface WorkflowAgentSpec {
@@ -13,6 +14,8 @@ export interface WorkflowAgentSpec {
 	workspace?: WorkspaceMode;
 	timeoutMs?: number;
 	maxTurns?: number;
+	/** Validate the child's final response as JSON against this TypeBox schema. */
+	output?: TSchema;
 }
 
 export interface WorkflowAgentResult {
@@ -23,6 +26,8 @@ export interface WorkflowAgentResult {
 	patchArtifact?: string;
 	model?: string;
 	thinking?: ThinkingLevel;
+	/** Parsed value when the step declared an output schema. */
+	value?: unknown;
 	usage: {
 		turns: number;
 		input: number;
@@ -62,7 +67,8 @@ export interface WorkflowContext {
 export interface WorkflowDefinition<TInput = unknown, TResult = unknown> {
 	name: string;
 	description: string;
-	input?: unknown;
+	input?: TSchema;
+	output?: TSchema;
 	run(ctx: WorkflowContext, input: TInput): Promise<TResult> | TResult;
 }
 

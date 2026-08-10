@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
+import { Type } from "typebox";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { RunStore } from "../src/run-store.ts";
 import { SubagentRuntime } from "../src/runtime.ts";
@@ -62,6 +63,7 @@ test("workflow engine fans out, joins, and persists stable steps", async () => {
 				async run(ctx) {
 					const first = await ctx.agent("first", {
 						agent: "mock",
+						context: "summary",
 						difficulty: 4,
 						task: "first",
 					});
@@ -81,6 +83,7 @@ test("workflow engine fans out, joins, and persists stable steps", async () => {
 			{
 				cwd: directory,
 				background: true,
+				contextSummary: "bounded parent summary",
 				defaultModel: "parent/model",
 				defaultThinking: "medium",
 				routing: {
@@ -124,6 +127,10 @@ test("workflow engine fans out, joins, and persists stable steps", async () => {
 		assert.deepEqual(
 			children.map((record) => record.model),
 			["routed/model", "routed/model", "routed/model"],
+		);
+		assert.match(
+			children.find((record) => record.stepId === "first")?.task ?? "",
+			/<workflow_context>\nbounded parent summary/,
 		);
 		assert.deepEqual(
 			children.map((record) => record.difficulty).sort(),
@@ -172,6 +179,7 @@ test("workflow resume keeps the original routing snapshot", async () => {
 		const oldRouting = {
 			defaultModel: "old/model",
 			defaultThinking: "medium" as const,
+			scopedModels: ["old/model"],
 			agentModels: {},
 			agents: { mock: agent },
 		};
@@ -222,6 +230,10 @@ test("workflow resume keeps the original routing snapshot", async () => {
 			"old/model",
 		);
 		assert.deepEqual(
+			runtime.store.readWorkflow(resumed.id)?.routing?.scopedModels,
+			["old/model"],
+		);
+		assert.deepEqual(
 			runtime
 				.list(100)
 				.filter((record) => record.parentRunId === resumed.id)
@@ -231,6 +243,49 @@ test("workflow resume keeps the original routing snapshot", async () => {
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
 		else process.env.PI_SUBAGENTS_PI_BIN = previous;
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("workflow validates declared input before running user code", async () => {
+	const directory = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-subagents-workflow-schema-"),
+	);
+	try {
+		const runtime = new SubagentRuntime(
+			new RunStore(path.join(directory, "runs")),
+		);
+		const engine = new WorkflowEngine(runtime);
+		let executed = false;
+		const workflow: DiscoveredWorkflow = {
+			source: "user",
+			filePath: path.join(directory, "schema.workflow.ts"),
+			definitionHash: "schema-hash",
+			definition: {
+				name: "schema-flow",
+				description: "test",
+				input: Type.Object(
+					{ request: Type.String() },
+					{ additionalProperties: false },
+				),
+				output: Type.String(),
+				run() {
+					executed = true;
+					return "ok";
+				},
+			},
+		};
+		await assert.rejects(
+			engine.start(
+				workflow,
+				{ request: 42 },
+				{ cwd: directory, background: false, resolveAgent: () => undefined },
+			),
+			/does not match its declared schema/,
+		);
+		assert.equal(executed, false);
+		assert.equal(runtime.list(10).length, 0);
+	} finally {
 		fs.rmSync(directory, { recursive: true, force: true });
 	}
 });

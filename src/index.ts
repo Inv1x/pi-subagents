@@ -6,7 +6,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { buildChildSystemPrompt, discoverAgents } from "./agents.ts";
+import {
+	buildChildSystemPrompt,
+	discoverAgents,
+	resolveNamedSkillPaths,
+} from "./agents.ts";
 import { loadConfig } from "./config.ts";
 import { THINKING_LEVELS } from "./model-options.ts";
 import { openAgentModelSettings } from "./model-settings.ts";
@@ -33,7 +37,11 @@ import {
 	renderRunResult,
 } from "./ui.ts";
 import type { WorkflowAgentSpec } from "./workflow-api.ts";
-import { discoverWorkflows, getWorkflowEngine } from "./workflows.ts";
+import {
+	discoverWorkflows,
+	getWorkflowEngine,
+	loadWorkflowForExecution,
+} from "./workflows.ts";
 
 const ThinkingSchema = StringEnum(THINKING_LEVELS);
 const ContextSchema = StringEnum(["fresh", "summary"] as const);
@@ -52,132 +60,147 @@ type StatusActivation = {
 	sessionId?: unknown;
 };
 
-const SubagentRunParams = Type.Object({
-	agent: Type.String({
-		description:
-			"Descriptive name for this child run, such as task-auditor or api-scout. May also be an exact discovered agent name.",
-		pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$",
-	}),
-	baseAgent: Type.Optional(
-		Type.String({
+const SubagentRunParams = Type.Object(
+	{
+		agent: Type.String({
 			description:
-				"Exact discovered agent definition whose prompt and tools this named child should use. Omit to use an exact agent-name match, then the general role as fallback.",
+				"Descriptive name for this child run, such as task-auditor or api-scout. May also be an exact discovered agent name.",
+			pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$",
 		}),
-	),
-	task: Type.String({ description: "Focused task delegated to the child" }),
-	background: Type.Optional(
-		Type.Boolean({
-			description: "Return immediately and continue in the background",
-		}),
-	),
-	context: Type.Optional(ContextSchema),
-	model: Type.Optional(
-		Type.String({
-			minLength: 1,
-			description:
-				"Exact provider/model override. Omit to use difficulty-based agent profiles, then agent/parent defaults; never invent a model name.",
-		}),
-	),
-	thinking: Type.Optional(ThinkingSchema),
-	difficulty: Type.Optional(
-		Type.Integer({
-			minimum: 1,
-			maximum: 5,
-			description:
-				"Head-agent estimate of task difficulty: 1 trivial, 2 light, 3 standard, 4 complex, 5 critical. Defaults to 3 and selects a configured model profile.",
-		}),
-	),
-	cwd: Type.Optional(
-		Type.String({
-			description:
-				"Child working directory, relative to the current cwd or absolute",
-		}),
-	),
-	workspace: Type.Optional(WorkspaceSchema),
-	timeoutMs: Type.Optional(
-		Type.Integer({
-			minimum: 1,
-			description:
-				"Optional hard wall-clock ceiling in milliseconds. Omit to inherit the agent/config default; avoid short ad hoc timeouts for repository-scale tasks.",
-		}),
-	),
-	maxTurns: Type.Optional(
-		Type.Integer({
-			minimum: 1,
-			description:
-				"Optional hard assistant-turn ceiling. Omit to inherit the agent/config default; do not guess a low cap for broad or long-running work.",
-		}),
-	),
-	maxRetries: Type.Optional(
-		Type.Integer({
-			minimum: 0,
-			maximum: 5,
-			description:
-				"Whole-child retries after Pi exhausts its own transient-error retries. Defaults to extension configuration.",
-		}),
-	),
-	agentScope: Type.Optional(AgentScopeSchema),
-	confirmProjectAgent: Type.Optional(
-		Type.Boolean({
-			description:
-				"Prompt before executing a project-local agent; defaults to true",
-		}),
-	),
-});
+		baseAgent: Type.Optional(
+			Type.String({
+				description:
+					"Exact discovered agent definition whose prompt and tools this named child should use. Omit to use an exact agent-name match, then the general role as fallback.",
+			}),
+		),
+		task: Type.String({ description: "Focused task delegated to the child" }),
+		background: Type.Optional(
+			Type.Boolean({
+				description: "Return immediately and continue in the background",
+			}),
+		),
+		context: Type.Optional(ContextSchema),
+		model: Type.Optional(
+			Type.String({
+				minLength: 1,
+				description:
+					"Exact provider/model override. Omit to use difficulty-based agent profiles, then agent/parent defaults; never invent a model name.",
+			}),
+		),
+		thinking: Type.Optional(ThinkingSchema),
+		difficulty: Type.Optional(
+			Type.Integer({
+				minimum: 1,
+				maximum: 5,
+				description:
+					"Head-agent estimate of task difficulty: 1 trivial, 2 light, 3 standard, 4 complex, 5 critical. Defaults to 3 and selects a configured model profile.",
+			}),
+		),
+		cwd: Type.Optional(
+			Type.String({
+				description:
+					"Child working directory, relative to the current cwd or absolute",
+			}),
+		),
+		workspace: Type.Optional(WorkspaceSchema),
+		timeoutMs: Type.Optional(
+			Type.Integer({
+				minimum: 1,
+				description:
+					"Optional hard wall-clock ceiling in milliseconds. Omit to inherit the agent/config default; avoid short ad hoc timeouts for repository-scale tasks.",
+			}),
+		),
+		maxTurns: Type.Optional(
+			Type.Integer({
+				minimum: 1,
+				description:
+					"Optional hard assistant-turn ceiling. Omit to inherit the agent/config default; do not guess a low cap for broad or long-running work.",
+			}),
+		),
+		maxRetries: Type.Optional(
+			Type.Integer({
+				minimum: 0,
+				maximum: 5,
+				description:
+					"Whole-child retries after Pi exhausts its own transient-error retries. Defaults to extension configuration.",
+			}),
+		),
+		agentScope: Type.Optional(AgentScopeSchema),
+		confirmProjectAgent: Type.Optional(
+			Type.Boolean({
+				description:
+					"Prompt before executing a project-local agent; defaults to true",
+			}),
+		),
+	},
+	{ additionalProperties: false },
+);
 
-const ControlParams = Type.Object({
-	action: StringEnum([
-		"list",
-		"status",
-		"wait",
-		"send",
-		"interrupt",
-		"stop",
-	] as const),
-	runId: Type.Optional(
-		Type.String({ description: "Full run id or unambiguous prefix" }),
-	),
-	message: Type.Optional(
-		Type.String({
-			description: "Message for send (stateful transport is not yet available)",
-		}),
-	),
-	timeoutMs: Type.Optional(
-		Type.Integer({
-			minimum: 1,
-			description:
-				"How long to observe this wait before returning the current state; the run continues after the window ends",
-		}),
-	),
-});
+const ControlParams = Type.Object(
+	{
+		action: StringEnum([
+			"list",
+			"status",
+			"wait",
+			"send",
+			"interrupt",
+			"stop",
+		] as const),
+		runId: Type.Optional(
+			Type.String({ description: "Full run id or unambiguous prefix" }),
+		),
+		message: Type.Optional(
+			Type.String({
+				description:
+					"Message for send (stateful transport is not yet available)",
+			}),
+		),
+		timeoutMs: Type.Optional(
+			Type.Integer({
+				minimum: 1,
+				description:
+					"How long to observe this wait before returning the current state; the run continues after the window ends",
+			}),
+		),
+	},
+	{ additionalProperties: false },
+);
 
-const WorkflowRunParams = Type.Object({
-	workflow: Type.String(),
-	input: Type.Unknown({
-		description: "Workflow input, commonly a string or { request: string }",
-	}),
-	background: Type.Optional(
-		Type.Boolean({
-			description:
-				"Return immediately and continue the workflow in the background",
+const WorkflowRunParams = Type.Object(
+	{
+		workflow: Type.String(),
+		input: Type.Unknown({
+			description: "Workflow input, commonly a string or { request: string }",
 		}),
-	),
-	preview: Type.Optional(
-		Type.Boolean({ description: "Show a confirmation preview before launch" }),
-	),
-});
+		background: Type.Optional(
+			Type.Boolean({
+				description:
+					"Return immediately and continue the workflow in the background",
+			}),
+		),
+		preview: Type.Optional(
+			Type.Boolean({
+				description: "Show a confirmation preview before launch",
+			}),
+		),
+	},
+	{ additionalProperties: false },
+);
 
-const WorkflowControlParams = Type.Object({
-	action: StringEnum(["list", "status", "wait", "stop", "resume"] as const),
-	runId: Type.Optional(Type.String()),
-	timeoutMs: Type.Optional(
-		Type.Integer({
-			minimum: 1,
-			description:
-				"How long to observe this wait before returning the current state; the workflow continues after the window ends",
-		}),
-	),
-});
+const WorkflowControlParams = Type.Object(
+	{
+		action: StringEnum(["list", "status", "wait", "stop", "resume"] as const),
+		runId: Type.Optional(Type.String()),
+		timeoutMs: Type.Optional(
+			Type.Integer({
+				minimum: 1,
+				description:
+					"How long to observe this wait before returning the current state; the workflow continues after the window ends",
+			}),
+		),
+	},
+	{ additionalProperties: false },
+);
 
 function textFromMessage(message: unknown): string {
 	if (!message || typeof message !== "object") return "";
@@ -220,20 +243,36 @@ function selectedModel(ctx: ExtensionContext): string | undefined {
 function canonicalModelSpec(
 	ctx: ExtensionContext,
 	requested: string | undefined,
+	pinnedScope: readonly string[] | undefined = ctx.scopedModels.length > 0
+		? ctx.scopedModels.map(({ model }) => `${model.provider}/${model.id}`)
+		: undefined,
 ): string | undefined {
 	if (!requested) return selectedModel(ctx);
+	const allowed = pinnedScope ? new Set(pinnedScope) : undefined;
 	const separator = requested.indexOf("/");
 	if (separator > 0) {
 		const provider = requested.slice(0, separator);
 		const modelId = requested.slice(separator + 1);
-		if (ctx.modelRegistry.find(provider, modelId)) return requested;
+		if (
+			ctx.modelRegistry.find(provider, modelId) &&
+			(!allowed || allowed.has(requested))
+		)
+			return requested;
 		throw new Error(
-			`Unknown child model '${requested}'. Use an exact available provider/model identifier.`,
+			`Child model '${requested}' is unknown or outside the current scopedModels selection.`,
 		);
 	}
-	const matches = ctx.modelRegistry
-		.getAvailable()
-		.filter((model) => model.id === requested);
+	const candidates = allowed
+		? [...allowed].flatMap((reference) => {
+				const split = reference.indexOf("/");
+				const found = ctx.modelRegistry.find(
+					reference.slice(0, split),
+					reference.slice(split + 1),
+				);
+				return found ? [found] : [];
+			})
+		: ctx.modelRegistry.getAvailable();
+	const matches = candidates.filter((model) => model.id === requested);
 	const currentProviderMatch = matches.find(
 		(model) => model.provider === ctx.model?.provider,
 	);
@@ -335,6 +374,11 @@ function resolveRequest(
 		maxTurns,
 		maxRetries: params.maxRetries,
 		systemPrompt,
+		skillPaths: resolveNamedSkillPaths(
+			definition.skills,
+			ctx.cwd,
+			ctx.isProjectTrusted(),
+		),
 	};
 }
 
@@ -347,6 +391,13 @@ function createWorkflowRouting(
 	return {
 		defaultModel: selectedModel(ctx),
 		defaultThinking: parentThinking,
+		...(ctx.scopedModels.length > 0
+			? {
+					scopedModels: ctx.scopedModels.map(
+						({ model }) => `${model.provider}/${model.id}`,
+					),
+				}
+			: {}),
 		agentModels: config.agentModels,
 		agents: Object.fromEntries(agents.map((agent) => [agent.name, agent])),
 	};
@@ -368,7 +419,7 @@ function resolveWorkflowAgentRoute(
 		parentModel: routing.defaultModel,
 		parentThinking: routing.defaultThinking,
 	});
-	const model = canonicalModelSpec(ctx, route.model);
+	const model = canonicalModelSpec(ctx, route.model, routing.scopedModels);
 	return {
 		...route,
 		model,
@@ -580,6 +631,7 @@ export default function (pi: ExtensionAPI) {
 			"Never run concurrent write-capable subagent_run calls in a shared workspace; select worktree isolation or serialize them.",
 		],
 		parameters: SubagentRunParams,
+		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
 			runtime.configure(config);
@@ -693,6 +745,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"List, inspect, wait for, interrupt, or stop subagent runs. Status is a one-shot inspection, not a polling loop. Stateful send is reserved for a future persistent transport.",
 		parameters: ControlParams,
+		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (params.action === "list") {
@@ -804,8 +857,13 @@ export default function (pi: ExtensionAPI) {
 			);
 			const shouldPreview =
 				params.preview === true ||
-				(workflow.source === "project" && config.confirmProjectWorkflows) ||
+				workflow.source === "project" ||
 				(projectAgents.length > 0 && config.confirmProjectAgents);
+			if (workflow.source === "project" && shouldPreview && !ctx.hasUI) {
+				throw new Error(
+					"Project workflow execution requires an interactive launch confirmation.",
+				);
+			}
 			if (shouldPreview && ctx.hasUI) {
 				const details = [
 					`${workflow.definition.name}: ${workflow.definition.description}`,
@@ -823,6 +881,7 @@ export default function (pi: ExtensionAPI) {
 				if (!(await ctx.ui.confirm("Launch workflow?", details)))
 					throw new Error("Workflow launch was not approved.");
 			}
+			const executableWorkflow = await loadWorkflowForExecution(workflow);
 			let parentId: string | undefined;
 			const unsubscribe = runtime.subscribe((update) => {
 				if (update.run.id !== parentId) return;
@@ -845,26 +904,32 @@ export default function (pi: ExtensionAPI) {
 				pi.getThinkingLevel(),
 			);
 			try {
-				const record = await workflowEngine.start(workflow, params.input, {
-					cwd: ctx.cwd,
-					sessionId: ctx.sessionManager.getSessionId(),
-					background: params.background ?? false,
-					defaultModel: routing.defaultModel,
-					defaultThinking: routing.defaultThinking,
-					routing,
-					resolveAgentRoute: (definition, spec, pinnedRouting) =>
-						resolveWorkflowAgentRoute(
-							definition,
-							spec,
-							ctx,
-							pinnedRouting ?? routing,
-						),
-					resolveAgent: (name) => agents.find((agent) => agent.name === name),
-					signal: params.background ? undefined : abortController.signal,
-					onCreated: (created) => {
-						parentId = created.id;
+				const record = await workflowEngine.start(
+					executableWorkflow,
+					params.input,
+					{
+						cwd: ctx.cwd,
+						contextSummary: parentSummary(ctx),
+						projectTrusted: ctx.isProjectTrusted(),
+						sessionId: ctx.sessionManager.getSessionId(),
+						background: params.background ?? false,
+						defaultModel: routing.defaultModel,
+						defaultThinking: routing.defaultThinking,
+						routing,
+						resolveAgentRoute: (definition, spec, pinnedRouting) =>
+							resolveWorkflowAgentRoute(
+								definition,
+								spec,
+								ctx,
+								pinnedRouting ?? routing,
+							),
+						resolveAgent: (name) => agents.find((agent) => agent.name === name),
+						signal: params.background ? undefined : abortController.signal,
+						onCreated: (created) => {
+							parentId = created.id;
+						},
 					},
-				});
+				);
 				parentId = record.id;
 				return {
 					content: [
@@ -899,6 +964,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"List, inspect, wait for, stop, or resume programmatic workflow runs.",
 		parameters: WorkflowControlParams,
+		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (params.action === "list") {
@@ -1000,6 +1066,20 @@ export default function (pi: ExtensionAPI) {
 				scope: ctx.isProjectTrusted() ? "both" : "user",
 				config,
 			});
+			if (workflow.source === "project") {
+				if (!ctx.hasUI)
+					throw new Error(
+						"Project workflow resume requires an interactive confirmation.",
+					);
+				if (
+					!(await ctx.ui.confirm(
+						"Resume project workflow?",
+						`${workflow.definition.name}: ${workflow.definition.description}\nSource: ${workflow.filePath}`,
+					))
+				)
+					throw new Error("Workflow resume was not approved.");
+			}
+			const executableWorkflow = await loadWorkflowForExecution(workflow);
 			const snapshot = runtime.store.readWorkflow(previous.id);
 			const routing = createWorkflowRouting(
 				config,
@@ -1007,23 +1087,29 @@ export default function (pi: ExtensionAPI) {
 				ctx,
 				pi.getThinkingLevel(),
 			);
-			const resumed = await workflowEngine.start(workflow, snapshot?.input, {
-				cwd: previous.cwd,
-				sessionId: ctx.sessionManager.getSessionId(),
-				background: true,
-				defaultModel: routing.defaultModel,
-				defaultThinking: routing.defaultThinking,
-				routing,
-				resolveAgentRoute: (definition, spec, pinnedRouting) =>
-					resolveWorkflowAgentRoute(
-						definition,
-						spec,
-						ctx,
-						pinnedRouting ?? routing,
-					),
-				resolveAgent: (name) => agents.find((agent) => agent.name === name),
-				existingRunId: previous.id,
-			});
+			const resumed = await workflowEngine.start(
+				executableWorkflow,
+				snapshot?.input,
+				{
+					cwd: previous.cwd,
+					contextSummary: snapshot?.contextSummary,
+					projectTrusted: ctx.isProjectTrusted(),
+					sessionId: ctx.sessionManager.getSessionId(),
+					background: true,
+					defaultModel: routing.defaultModel,
+					defaultThinking: routing.defaultThinking,
+					routing,
+					resolveAgentRoute: (definition, spec, pinnedRouting) =>
+						resolveWorkflowAgentRoute(
+							definition,
+							spec,
+							ctx,
+							pinnedRouting ?? routing,
+						),
+					resolveAgent: (name) => agents.find((agent) => agent.name === name),
+					existingRunId: previous.id,
+				},
+			);
 			return {
 				content: [{ type: "text", text: `Resumed workflow ${resumed.id}.` }],
 				details: { runs: [resumed] },
@@ -1190,6 +1276,12 @@ export default function (pi: ExtensionAPI) {
 			);
 			if (!workflow)
 				return ctx.ui.notify(`Unknown workflow '${name}'.`, "error");
+			if (workflow.source === "project" && !ctx.hasUI) {
+				return ctx.ui.notify(
+					"Project workflow execution requires an interactive launch confirmation.",
+					"error",
+				);
+			}
 			if (
 				(workflow.source === "project" || config.confirmProjectWorkflows) &&
 				ctx.hasUI
@@ -1200,6 +1292,7 @@ export default function (pi: ExtensionAPI) {
 				);
 				if (!approved) return;
 			}
+			const executableWorkflow = await loadWorkflowForExecution(workflow);
 			const agents = discoverAgents({
 				cwd: ctx.cwd,
 				projectTrusted: ctx.isProjectTrusted(),
@@ -1212,8 +1305,10 @@ export default function (pi: ExtensionAPI) {
 				ctx,
 				pi.getThinkingLevel(),
 			);
-			const record = await workflowEngine.start(workflow, input, {
+			const record = await workflowEngine.start(executableWorkflow, input, {
 				cwd: ctx.cwd,
+				contextSummary: parentSummary(ctx),
+				projectTrusted: ctx.isProjectTrusted(),
 				sessionId: ctx.sessionManager.getSessionId(),
 				background,
 				defaultModel: routing.defaultModel,
@@ -1297,10 +1392,19 @@ export default function (pi: ExtensionAPI) {
 				`Pi executable: ${process.execPath}`,
 			];
 			await ctx.modelRegistry.refresh();
+			const scopedModelReferences = ctx.scopedModels.map(
+				({ model }) => `${model.provider}/${model.id}`,
+			);
+			lines.push(
+				ctx.scopedModels.length > 0
+					? `Scoped models: ${scopedModelReferences.length} (${scopedModelReferences.join(", ")})`
+					: "Scoped models: unrestricted",
+			);
 			const availableModels = new Set(
-				ctx.modelRegistry
-					.getAvailable()
-					.map((model) => `${model.provider}/${model.id}`),
+				(ctx.scopedModels.length > 0
+					? ctx.scopedModels.map(({ model }) => model)
+					: ctx.modelRegistry.getAvailable()
+				).map((model) => `${model.provider}/${model.id}`),
 			);
 			const unavailableProfiles = Object.entries(config.agentModels).flatMap(
 				([agent, profiles]) =>
@@ -1312,10 +1416,17 @@ export default function (pi: ExtensionAPI) {
 				lines.push(
 					`Warning: unavailable configured models: ${unavailableProfiles.join(", ")}`,
 				);
-			if (agents.some((agent) => agent.skills.length))
-				lines.push(
-					"Warning: agent frontmatter skills are parsed but explicit child skill-path loading is not implemented yet.",
-				);
+			for (const agent of agents.filter(
+				(candidate) => candidate.skills.length,
+			)) {
+				try {
+					resolveNamedSkillPaths(agent.skills, ctx.cwd, ctx.isProjectTrusted());
+				} catch (error) {
+					lines.push(
+						`Warning: ${agent.name}: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+			}
 			ctx.ui.notify(
 				lines.join("\n"),
 				stale || unavailableProfiles.length ? "warning" : "info",

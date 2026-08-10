@@ -15,7 +15,7 @@ function agent(filePath: string): AgentDefinition {
 		context: "fresh",
 		workspace: "shared",
 		maxTurns: 3,
-		timeoutMs: 1000,
+		timeoutMs: 5000,
 		skills: [],
 		systemPromptMode: "replace",
 		inheritProjectContext: false,
@@ -31,7 +31,7 @@ test("CLI transport parses events, activity, usage, and output", async () => {
 	const script = path.join(directory, "mock-pi.mjs");
 	fs.writeFileSync(
 		script,
-		`#!/usr/bin/env node\nconst value=(flag)=>process.argv[process.argv.indexOf(flag)+1];\nif(value('--model')!=='requested/model'||value('--thinking')!=='high') process.exit(2);\nconsole.log(JSON.stringify({type:'session',version:3,id:'s',cwd:process.cwd()}));\nconsole.log(JSON.stringify({type:'tool_execution_start',toolName:'read',args:{path:'src/a.ts'}}));\nconsole.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'Mock result'}],usage:{input:10,output:4,cacheRead:2,cacheWrite:1,totalTokens:17,cost:{total:0.01}},provider:'requested',model:'model',responseModel:'actual-model',stopReason:'stop',timestamp:Date.now()}}));\nconsole.log(JSON.stringify({type:'agent_settled'}));\n`,
+		`#!/usr/bin/env node\nconst value=(flag)=>process.argv[process.argv.indexOf(flag)+1];\nif(value('--model')!=='requested/model'||value('--thinking')!=='high'||!process.argv.includes('--no-skills')) process.exit(2);\nconsole.log(JSON.stringify({type:'session',version:3,id:'s',cwd:process.cwd()}));\nconsole.log(JSON.stringify({type:'tool_execution_start',toolName:'read',args:{path:'src/a.ts'}}));\nconsole.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'Mock result'}],usage:{input:10,output:4,cacheRead:2,cacheWrite:1,totalTokens:17,cost:{total:0.01}},provider:'requested',model:'model',responseModel:'actual-model',stopReason:'stop',timestamp:Date.now()}}));\nconsole.log(JSON.stringify({type:'agent_settled'}));\n`,
 	);
 	fs.chmodSync(script, 0o755);
 	const previous = process.env.PI_SUBAGENTS_PI_BIN;
@@ -47,7 +47,7 @@ test("CLI transport parses events, activity, usage, and output", async () => {
 			context: "fresh",
 			cwd: directory,
 			workspace: "shared",
-			timeoutMs: 1000,
+			timeoutMs: 5000,
 			maxTurns: 3,
 			model: "requested/model",
 			thinking: "high",
@@ -70,6 +70,103 @@ test("CLI transport parses events, activity, usage, and output", async () => {
 		assert.equal(result.model, "requested/actual-model");
 		assert.ok(events.includes("activity"));
 		assert.ok(events.includes("settled"));
+	} finally {
+		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
+		else process.env.PI_SUBAGENTS_PI_BIN = previous;
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("CLI transport assembles Pi 0.84 delta-only updates but trusts message_end", async () => {
+	const directory = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-subagents-delta-fixture-"),
+	);
+	const script = path.join(directory, "mock-pi.mjs");
+	const fixture = path.resolve("test/fixtures/pi-0.84-delta-only.jsonl");
+	fs.writeFileSync(
+		script,
+		`#!/usr/bin/env node\nimport fs from 'node:fs';\nprocess.stdout.write(fs.readFileSync(${JSON.stringify(fixture)}, 'utf8'));\n`,
+	);
+	fs.chmodSync(script, 0o755);
+	const previous = process.env.PI_SUBAGENTS_PI_BIN;
+	process.env.PI_SUBAGENTS_PI_BIN = script;
+	try {
+		const definition = agent(script);
+		const partials: string[] = [];
+		const result = await runCliAgent({
+			runId: "agent_delta_fixture",
+			runDirectory: directory,
+			request: {
+				agent: definition.name,
+				task: "test",
+				definition,
+				difficulty: 3,
+				background: false,
+				context: "fresh",
+				cwd: directory,
+				workspace: "shared",
+				timeoutMs: 5000,
+				maxTurns: 3,
+				systemPrompt: "mock",
+			},
+			signal: new AbortController().signal,
+			resultMaxBytes: 1024,
+			transcriptMaxEvents: 20,
+			onEvent: (event) => {
+				if (event.type === "assistant" && event.data?.partial === true)
+					partials.push(String(event.data.text));
+			},
+		});
+		assert.equal(result.state, "succeeded");
+		assert.equal(result.output, "Authoritative final");
+		assert.equal(partials.at(-1), "Live preview");
+	} finally {
+		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
+		else process.env.PI_SUBAGENTS_PI_BIN = previous;
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("CLI transport rejects zero exits without complete settlement", async () => {
+	const directory = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-subagents-incomplete-"),
+	);
+	const script = path.join(directory, "mock-pi.mjs");
+	const fixture = path.resolve(
+		"test/fixtures/pi-0.84-missing-settlement.jsonl",
+	);
+	fs.writeFileSync(
+		script,
+		`#!/usr/bin/env node\nimport fs from 'node:fs';\nprocess.stdout.write(fs.readFileSync(${JSON.stringify(fixture)}, 'utf8'));\n`,
+	);
+	fs.chmodSync(script, 0o755);
+	const previous = process.env.PI_SUBAGENTS_PI_BIN;
+	process.env.PI_SUBAGENTS_PI_BIN = script;
+	try {
+		const definition = agent(script);
+		const result = await runCliAgent({
+			runId: "agent_incomplete",
+			runDirectory: directory,
+			request: {
+				agent: definition.name,
+				task: "test",
+				definition,
+				difficulty: 3,
+				background: false,
+				context: "fresh",
+				cwd: directory,
+				workspace: "shared",
+				timeoutMs: 5000,
+				maxTurns: 3,
+				systemPrompt: "mock",
+			},
+			signal: new AbortController().signal,
+			resultMaxBytes: 1024,
+			transcriptMaxEvents: 20,
+		});
+		assert.equal(result.state, "failed");
+		assert.equal(result.error?.code, "incomplete_child_protocol");
+		assert.match(result.error?.message ?? "", /agent_settled/);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
 		else process.env.PI_SUBAGENTS_PI_BIN = previous;
@@ -103,7 +200,7 @@ test("CLI transport fails instead of silently using a different model", async ()
 				context: "fresh",
 				cwd: directory,
 				workspace: "shared",
-				timeoutMs: 1000,
+				timeoutMs: 5000,
 				maxTurns: 3,
 				model: "openai-codex/gpt-5.6-luna",
 				thinking: "xhigh",
@@ -150,7 +247,7 @@ test("CLI transport clears a transient model error after Pi's internal retry suc
 				context: "fresh",
 				cwd: directory,
 				workspace: "shared",
-				timeoutMs: 1000,
+				timeoutMs: 5000,
 				maxTurns: 3,
 				systemPrompt: "mock",
 			},

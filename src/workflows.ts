@@ -4,7 +4,9 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { createJiti } from "jiti";
-import { buildChildSystemPrompt } from "./agents.ts";
+import type { TSchema } from "typebox";
+import { Value } from "typebox/value";
+import { buildChildSystemPrompt, resolveNamedSkillPaths } from "./agents.ts";
 import { observe } from "./observation.ts";
 import { truncateUtf8 } from "./protocol.ts";
 import {
@@ -79,33 +81,120 @@ export interface DiscoveredWorkflow {
 	source: WorkflowSource;
 	filePath: string;
 	definitionHash: string;
+	/** Project workflow code remains unloaded until launch confirmation. */
+	loaded?: boolean;
+}
+
+function validDefinition(
+	definition: unknown,
+): definition is WorkflowDefinition {
+	return Boolean(
+		definition &&
+			typeof definition === "object" &&
+			typeof (definition as WorkflowDefinition).name === "string" &&
+			/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(
+				(definition as WorkflowDefinition).name,
+			) &&
+			typeof (definition as WorkflowDefinition).description === "string" &&
+			typeof (definition as WorkflowDefinition).run === "function",
+	);
+}
+
+function literalMetadata(
+	sourceText: string,
+): { name: string; description: string } | undefined {
+	const literal = (field: string) => {
+		const match = sourceText.match(
+			new RegExp(`\\b${field}\\s*:\\s*(["'])((?:\\\\.|(?!\\1)[\\s\\S])*?)\\1`),
+		);
+		if (!match?.[2]) return undefined;
+		try {
+			return JSON.parse(`"${match[2].replace(/"/g, '\\"')}"`) as string;
+		} catch {
+			return match[2];
+		}
+	};
+	const name = literal("name");
+	const description = literal("description");
+	if (!name || !description || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(name))
+		return undefined;
+	return { name, description };
+}
+
+function readInertMetadata(filePath: string, sourceText: string) {
+	const metadataPath = filePath.replace(/\.(?:ts|js|mjs)$/, ".json");
+	try {
+		const metadata = JSON.parse(
+			fs.readFileSync(metadataPath, "utf8"),
+		) as Record<string, unknown>;
+		if (
+			typeof metadata.name === "string" &&
+			typeof metadata.description === "string" &&
+			/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(metadata.name)
+		)
+			return { name: metadata.name, description: metadata.description };
+	} catch {
+		// Companion metadata is optional; conservative literal extraction is inert.
+	}
+	return literalMetadata(sourceText);
 }
 
 async function loadFile(
 	filePath: string,
 	source: WorkflowSource,
 ): Promise<DiscoveredWorkflow | undefined> {
+	const sourceText = fs.readFileSync(filePath, "utf8");
+	const definitionHash = hash(sourceText);
+	if (source === "project") {
+		const metadata = readInertMetadata(filePath, sourceText);
+		if (!metadata) return undefined;
+		return {
+			definition: {
+				...metadata,
+				run: () => {
+					throw new Error(
+						"Project workflow was not activated after confirmation.",
+					);
+				},
+			},
+			source,
+			filePath,
+			definitionHash,
+			loaded: false,
+		};
+	}
 	try {
 		const definition = await jiti.import<WorkflowDefinition>(filePath, {
 			default: true,
 		});
-		if (!definition || typeof definition !== "object") return undefined;
-		if (
-			typeof definition.name !== "string" ||
-			!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(definition.name)
-		)
-			return undefined;
-		if (
-			typeof definition.description !== "string" ||
-			typeof definition.run !== "function"
-		)
-			return undefined;
-		const sourceText = fs.readFileSync(filePath, "utf8");
-		return { definition, source, filePath, definitionHash: hash(sourceText) };
+		if (!validDefinition(definition)) return undefined;
+		return { definition, source, filePath, definitionHash, loaded: true };
 	} catch (error) {
 		console.error(`[pi-subagents] Could not load workflow ${filePath}:`, error);
 		return undefined;
 	}
+}
+
+export async function loadWorkflowForExecution(
+	workflow: DiscoveredWorkflow,
+): Promise<DiscoveredWorkflow> {
+	if (workflow.loaded !== false) return workflow;
+	const sourceText = fs.readFileSync(workflow.filePath, "utf8");
+	if (hash(sourceText) !== workflow.definitionHash)
+		throw new Error(
+			"Project workflow changed after preview; preview it again.",
+		);
+	const definition = await jiti.import<WorkflowDefinition>(workflow.filePath, {
+		default: true,
+	});
+	if (
+		!validDefinition(definition) ||
+		definition.name !== workflow.definition.name
+	)
+		throw new Error(
+			"Project workflow export does not match its inert discovery metadata.",
+		);
+	return { ...workflow, definition, loaded: true };
 }
 
 export async function discoverWorkflows(
@@ -143,6 +232,8 @@ interface WorkflowExecutionOptions {
 		thinking: ResolvedAgentRunRequest["thinking"],
 	) => ResolvedAgentRunRequest["thinking"];
 	routing?: WorkflowRoutingSnapshot;
+	contextSummary?: string;
+	projectTrusted?: boolean;
 	resolveAgentRoute?: (
 		definition: AgentDefinition,
 		spec: WorkflowAgentSpec,
@@ -185,6 +276,39 @@ function stepError(error: unknown): RunError {
 		message: error instanceof Error ? error.message : String(error),
 		retryable: true,
 	};
+}
+
+function assertSchema(
+	schema: TSchema | undefined,
+	value: unknown,
+	label: string,
+): void {
+	if (!schema) return;
+	try {
+		if (Value.Check(schema, value)) return;
+	} catch (error) {
+		throw new Error(
+			`${label} schema is invalid: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	throw new Error(`${label} does not match its declared schema.`);
+}
+
+function parseStructuredOutput(
+	output: string,
+	schema: TSchema,
+	stepId: string,
+): unknown {
+	let value: unknown;
+	try {
+		value = JSON.parse(output);
+	} catch {
+		throw new Error(
+			`Step '${stepId}' declared an output schema but did not return valid JSON.`,
+		);
+	}
+	assertSchema(schema, value, `Step '${stepId}' output`);
+	return value;
 }
 
 function validateAgentSpec(spec: WorkflowAgentSpec): void {
@@ -238,6 +362,11 @@ export class WorkflowEngine {
 		input: unknown,
 		options: WorkflowExecutionOptions,
 	): Promise<RunRecord> {
+		assertSchema(
+			workflow.definition.input,
+			input,
+			`Workflow '${workflow.definition.name}' input`,
+		);
 		let record: RunRecord;
 		let snapshot: WorkflowSnapshot;
 		if (options.existingRunId) {
@@ -274,6 +403,9 @@ export class WorkflowEngine {
 				definitionPath: workflow.filePath,
 				definitionHash: workflow.definitionHash,
 				routing: options.routing,
+				...(options.contextSummary
+					? { contextSummary: options.contextSummary.slice(-12_000) }
+					: {}),
 				state: "queued",
 				createdAt: record.createdAt,
 				updatedAt: record.updatedAt,
@@ -444,14 +576,23 @@ export class WorkflowEngine {
 			persistStep(step);
 			const timeoutMs = spec.timeoutMs ?? definition.timeoutMs;
 			const maxTurns = spec.maxTurns ?? definition.maxTurns;
+			const context = spec.context ?? definition.context;
+			const summary = snapshot.contextSummary ?? options.contextSummary;
+			const taskWithContext =
+				context === "summary" && summary
+					? `${spec.task}\n\n<workflow_context>\n${summary}\n</workflow_context>`
+					: spec.task;
+			const task = spec.output
+				? `${taskWithContext}\n\nReturn the final response as JSON only, matching this schema:\n${JSON.stringify(spec.output)}`
+				: taskWithContext;
 			const request: ResolvedAgentRunRequest = {
 				agent: definition.name,
-				task: spec.task,
+				task,
 				definition,
 				difficulty: persistedRoute.difficulty,
 				profileMaxDifficulty: persistedRoute.profile?.maxDifficulty,
 				background: false,
-				context: spec.context ?? definition.context,
+				context,
 				cwd: spec.cwd ? path.resolve(options.cwd, spec.cwd) : options.cwd,
 				workspace: spec.workspace ?? definition.workspace,
 				timeoutMs,
@@ -460,6 +601,11 @@ export class WorkflowEngine {
 					maxTurns,
 					timeoutMs,
 				}),
+				skillPaths: resolveNamedSkillPaths(
+					definition.skills,
+					options.cwd,
+					options.projectTrusted ?? false,
+				),
 				model,
 				thinking,
 			};
@@ -478,6 +624,13 @@ export class WorkflowEngine {
 					},
 				});
 				const result = asAgentResult(child);
+				if (child.state === "succeeded" && spec.output) {
+					result.value = parseStructuredOutput(
+						result.output,
+						spec.output,
+						stepId,
+					);
+				}
 				step.state = child.state;
 				step.result = result;
 				step.error = child.error;
@@ -611,6 +764,11 @@ export class WorkflowEngine {
 		try {
 			const returned = await workflow.definition.run(context, snapshot.input);
 			const result = explicitResult ?? returned;
+			assertSchema(
+				workflow.definition.output,
+				result,
+				`Workflow '${workflow.definition.name}' output`,
+			);
 			snapshot.result = result;
 			this.setSnapshotState(snapshot, "succeeded");
 			const output =

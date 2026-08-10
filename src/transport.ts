@@ -182,7 +182,11 @@ export async function runCliAgent(
 	];
 	if (!request.definition.inheritProjectContext)
 		args.push("--no-context-files");
-	if (request.definition.skills.length === 0) args.push("--no-skills");
+	// Never expose ambient skills to a child. Named skills are resolved by the
+	// trusted parent and loaded additively by exact path.
+	args.push("--no-skills");
+	for (const skillPath of request.skillPaths ?? [])
+		args.push("--skill", skillPath);
 	if (request.definition.tools) {
 		if (request.definition.tools.length === 0) args.push("--no-tools");
 		else args.push("--tools", request.definition.tools.join(","));
@@ -202,7 +206,6 @@ export async function runCliAgent(
 	const invocation = piInvocation(args);
 	const usage = emptyUsage();
 	const transcript: string[] = [];
-	const outputs: string[] = [];
 	const stderr = createByteTail();
 	let child: ChildProcess | undefined;
 	let timedOut = false;
@@ -211,6 +214,12 @@ export async function runCliAgent(
 	let protocolError: RunError | undefined;
 	let modelName = model;
 	let stopError: string | undefined;
+	let authoritativeOutput = "";
+	let sawAuthoritativeFinal = false;
+	let sawSettled = false;
+	let settlementHadFinal = false;
+	const liveText = new Map<number, string>();
+	let liveTruncated = false;
 
 	const remember = (line: string) => {
 		transcript.push(line);
@@ -250,6 +259,59 @@ export async function runCliAgent(
 					return;
 				}
 				const type = typeof event.type === "string" ? event.type : "unknown";
+				if (type === "message_start") {
+					liveText.clear();
+					liveTruncated = false;
+				}
+				if (
+					type === "message_update" &&
+					event.assistantMessageEvent &&
+					typeof event.assistantMessageEvent === "object"
+				) {
+					const deltaEvent = event.assistantMessageEvent as Record<
+						string,
+						unknown
+					>;
+					if (
+						deltaEvent.type === "text_delta" &&
+						typeof deltaEvent.contentIndex === "number" &&
+						typeof deltaEvent.delta === "string" &&
+						!liveTruncated
+					) {
+						const index = deltaEvent.contentIndex;
+						const retainedBytes =
+							[...liveText.values()].reduce(
+								(total, text) => total + Buffer.byteLength(text),
+								0,
+							) +
+							Math.max(0, liveText.size - 1) +
+							(!liveText.has(index) && liveText.size > 0 ? 1 : 0);
+						const remaining = Math.max(
+							0,
+							options.resultMaxBytes - retainedBytes,
+						);
+						const boundedDelta = truncateUtf8(deltaEvent.delta, remaining);
+						const retainedDelta = boundedDelta.truncated
+							? boundedDelta.text.split("\n\n[Output truncated:", 1)[0]
+							: boundedDelta.text;
+						liveText.set(index, `${liveText.get(index) ?? ""}${retainedDelta}`);
+						liveTruncated = boundedDelta.truncated;
+						const combined = [...liveText.entries()]
+							.sort(([left], [right]) => left - right)
+							.map(([, text]) => text)
+							.join("\n");
+						options.onEvent?.({
+							type: "assistant",
+							data: {
+								text: liveTruncated
+									? `${combined}\n\n[Live output truncated; message_end remains authoritative.]`
+									: combined,
+								partial: true,
+								truncated: liveTruncated,
+							},
+						});
+					}
+				}
 				if (type === "tool_execution_start") {
 					const activity = toolActivity(event);
 					remember(`tool: ${activity.message}`);
@@ -348,10 +410,18 @@ export async function runCliAgent(
 								assistant.errorMessage ?? "The model reported an error.";
 						else stopError = undefined;
 						const text = finalText(message);
+						const terminalAssistant =
+							assistant.stopReason === "stop" ||
+							assistant.stopReason === "end" ||
+							assistant.stopReason === "length";
+						sawAuthoritativeFinal = terminalAssistant && Boolean(text);
+						if (terminalAssistant) authoritativeOutput = text;
 						if (text) {
-							outputs.push(text);
 							remember(`assistant: ${text.slice(0, 500)}`);
-							options.onEvent?.({ type: "assistant", data: { text } });
+							options.onEvent?.({
+								type: "assistant",
+								data: { text, partial: false },
+							});
 						}
 						options.onEvent?.({
 							type: "usage",
@@ -371,7 +441,11 @@ export async function runCliAgent(
 						}
 					}
 				}
-				if (type === "agent_settled") options.onEvent?.({ type: "settled" });
+				if (type === "agent_settled") {
+					sawSettled = true;
+					settlementHadFinal = sawAuthoritativeFinal;
+					options.onEvent?.({ type: "settled" });
+				}
 			},
 			onLimit(error) {
 				protocolError = {
@@ -416,7 +490,7 @@ export async function runCliAgent(
 		});
 	});
 
-	const fullOutput = outputs.at(-1) ?? "";
+	const fullOutput = authoritativeOutput;
 	const bounded = truncateUtf8(fullOutput, options.resultMaxBytes);
 	let state: TransportResult["state"] = "succeeded";
 	let error: RunError | undefined;
@@ -453,6 +527,15 @@ export async function runCliAgent(
 			code: stopError ? "model_or_spawn_error" : "child_exit",
 			message,
 			retryable: isTransientTransportError(message),
+		};
+	} else if (!sawSettled || !settlementHadFinal) {
+		state = "failed";
+		error = {
+			code: "incomplete_child_protocol",
+			message: !sawSettled
+				? "Pi child exited successfully without an agent_settled watermark."
+				: "Pi child settled without an authoritative final assistant result.",
+			retryable: false,
 		};
 	}
 

@@ -145,6 +145,8 @@ export interface ResolvedAgentRunRequest extends AgentRunRequest {
 	timeoutMs: number;
 	maxTurns: number;
 	systemPrompt: string;
+	/** Exact skill files explicitly passed to the child process. */
+	skillPaths?: string[];
 }
 
 export interface TransportEvent {
@@ -217,6 +219,8 @@ export interface WorkflowStepRecord {
 export interface WorkflowRoutingSnapshot {
 	defaultModel?: string;
 	defaultThinking?: ThinkingLevel;
+	/** Undefined means the parent session was not model-scoped. */
+	scopedModels?: string[];
 	agentModels: Record<string, AgentModelProfile[]>;
 	agents: Record<string, AgentDefinition>;
 }
@@ -229,6 +233,8 @@ export interface WorkflowSnapshot {
 	definitionPath?: string;
 	definitionHash: string;
 	routing?: WorkflowRoutingSnapshot;
+	/** Bounded parent context captured when the workflow was first launched. */
+	contextSummary?: string;
 	state: RunState;
 	createdAt: number;
 	updatedAt: number;

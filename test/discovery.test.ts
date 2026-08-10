@@ -3,9 +3,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import { buildChildSystemPrompt, discoverAgents } from "../src/agents.ts";
+import {
+	buildChildSystemPrompt,
+	discoverAgents,
+	resolveNamedSkillPaths,
+} from "../src/agents.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
-import { discoverWorkflows } from "../src/workflows.ts";
+import {
+	discoverWorkflows,
+	loadWorkflowForExecution,
+} from "../src/workflows.ts";
 
 test("builtin agents and workflows are discoverable", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-discovery-"));
@@ -65,6 +72,55 @@ test("child prompts expose generous limits and require a final handoff", () => {
 	assert.match(prompt, /reserve enough budget for a final response/);
 	assert.match(prompt, /best evidence-based partial result/);
 	assert.match(prompt, /run name is repository-scout/);
+});
+
+test("trusted project workflow discovery is inert until launch approval", async () => {
+	const cwd = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-subagents-project-workflow-"),
+	);
+	const directory = path.join(cwd, ".pi", "workflows");
+	const marker = path.join(cwd, "executed");
+	fs.mkdirSync(directory, { recursive: true });
+	fs.writeFileSync(
+		path.join(directory, "safe.workflow.ts"),
+		`import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(marker)}, "executed");\nexport default { name: "safe-preview", description: "Inert preview", async run() { return "ok"; } };\n`,
+	);
+	try {
+		const workflows = await discoverWorkflows(cwd, true);
+		const workflow = workflows.find(
+			(candidate) => candidate.definition.name === "safe-preview",
+		);
+		assert.ok(workflow);
+		assert.equal(workflow.loaded, false);
+		assert.equal(fs.existsSync(marker), false);
+		const executable = await loadWorkflowForExecution(workflow);
+		assert.equal(executable.loaded, true);
+		assert.equal(fs.readFileSync(marker, "utf8"), "executed");
+	} finally {
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("named project skills resolve only in trusted discovery", () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-skill-"));
+	const skillName = "pi-subagents-test-review";
+	const skillPath = path.join(cwd, ".pi", "skills", skillName, "SKILL.md");
+	fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+	fs.writeFileSync(
+		skillPath,
+		`---\nname: ${skillName}\ndescription: Review code.\n---\n# Review\n`,
+	);
+	try {
+		assert.deepEqual(resolveNamedSkillPaths([skillName], cwd, true), [
+			skillPath,
+		]);
+		assert.throws(
+			() => resolveNamedSkillPaths([skillName], cwd, false),
+			/Unknown declared skill/,
+		);
+	} finally {
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
 });
 
 test("project agents require trust and override builtins", () => {

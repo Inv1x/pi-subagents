@@ -1,8 +1,10 @@
 # Pi Subagents — Product and Architecture Plan
 
-Status: implemented; current release 0.5.0  
-Target: `@earendil-works/pi-coding-agent` 0.81.x  
-Research date: 2026-07-20
+Status: stable core implemented in release 0.6.0; detached/stateful transport remains deferred
+
+Target: `@earendil-works/pi-coding-agent` 0.84.1
+
+Last modernization review: 2026-07-20
 
 ## 1. Goal
 
@@ -39,7 +41,7 @@ Source used: official Claude Code documentation through Context7 library `/websi
 
 ### Pi capabilities we should use
 
-Pi 0.81.x already gives us the needed extension primitives:
+Pi 0.84.1 gives us the needed extension primitives:
 
 - `pi.registerTool()` with streaming `onUpdate` and custom `renderCall`/`renderResult`.
 - Native concurrent execution of sibling tool calls.
@@ -220,7 +222,7 @@ Proposed locations:
 - User: `~/.pi/agent/workflows/**/*.workflow.ts`
 - Project: `.pi/workflows/**/*.workflow.ts`
 
-Project TypeScript workflows load only when `ctx.isProjectTrusted()` is true. The first launch displays source path, requested agents, write capability, worktree use, and estimated fan-out before execution.
+Project TypeScript workflows are discovered through inert companion/static metadata only when `ctx.isProjectTrusted()` is true. Listing and preview never import the module. The first launch displays the source path and warning, and imports the TypeScript only after interactive confirmation. Headless project-workflow launches fail closed because they cannot obtain that confirmation.
 
 ### 5.2 API shape
 
@@ -294,7 +296,7 @@ Workflow authors must use stable IDs and keep code deterministic between durable
 
 ### 5.5 Structured output
 
-Each child may declare a TypeBox/JSON Schema output. The worker prompt requests the schema, and the runtime validates before a step succeeds. Invalid output may receive one bounded repair attempt. Raw text remains available as an artifact.
+Each child may declare a TypeBox/JSON Schema output. The worker prompt requests JSON, and the runtime validates before a step succeeds. Invalid structured output fails the step (there is no automatic repair attempt). Workflow definitions may also declare input and output schemas, which are validated before workflow code runs and before success is persisted. Raw child text remains available as an artifact.
 
 ## 6. Runtime architecture
 
@@ -338,7 +340,8 @@ Initial transport: isolated Pi CLI process using JSON event-stream mode.
 - Launch with `--mode json`, `-p`, and `--no-session` for one-shot work.
 - Disable extension discovery by default to prevent recursion and unexpected side effects.
 - Pass only explicitly selected tools and child resources.
-- Parse complete `message_end`, tool lifecycle, retry, and settled events.
+- Assemble bounded delta-only `message_update` records for live display, while treating complete `message_end` as authoritative.
+- Require both an authoritative final assistant result and the final `agent_settled` watermark before a zero exit can succeed.
 - Keep the interface compatible with a future subprocess worker built on Pi's public SDK or RPC mode for stateful follow-ups.
 
 Do not begin with in-process children. Process isolation is more valuable than cold-start savings for the first reliable release.
@@ -475,7 +478,7 @@ When Pi emits several sibling `subagent_run` calls, each gets its own native too
 
 ### 8.2 Compact projection
 
-The shipped 0.5.0 UI intentionally avoids an above-editor widget. Active and recently finished work is projected into one footer status so child activity does not move the editor or crowd the transcript.
+The shipped 0.6.0 UI intentionally avoids an above-editor widget. Active and recently finished work is projected into one footer status so child activity does not move the editor or crowd the transcript.
 
 ### 8.3 Footer status
 

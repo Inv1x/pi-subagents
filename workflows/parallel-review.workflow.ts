@@ -1,4 +1,10 @@
+import { Type } from "typebox";
 import { defineWorkflow } from "../src/workflow-api.ts";
+
+const RequestInput = Type.Union([
+	Type.String(),
+	Type.Object({ request: Type.String() }, { additionalProperties: false }),
+]);
 
 function requestOf(input: unknown): string {
 	if (typeof input === "string") return input;
@@ -17,6 +23,8 @@ export default defineWorkflow({
 	name: "parallel-review",
 	description:
 		"Run independent correctness, test, and simplicity reviews concurrently.",
+	input: RequestInput,
+	output: Type.String(),
 	async run(ctx, input: unknown) {
 		const request = requestOf(input);
 		const focuses = [
@@ -29,6 +37,7 @@ export default defineWorkflow({
 			focuses,
 			(focus) => ({
 				agent: "reviewer",
+				context: "summary",
 				difficulty: 3,
 				task: `Review the implementation related to this request, focusing on ${focus}. Inspect current repository files, do not edit, and report only actionable findings with evidence.\n\nRequest:\n${request}`,
 			}),

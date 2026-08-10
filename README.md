@@ -105,7 +105,7 @@ Workflow context methods:
 - `ctx.setResult(value)`
 - `ctx.signal`
 
-Workflows cannot pause for approval or other runtime input; split interactive decision points into separate workflows. Project TypeScript workflows are arbitrary local code and require project trust plus a launch preview by default.
+Workflows cannot pause for approval or other runtime input; split interactive decision points into separate workflows. Project TypeScript workflows are arbitrary local code. Trusted-project listing and preview use inert companion/static metadata and do not import the module; execution requires an interactive confirmation, then imports the unchanged source. Headless project-workflow launches fail closed.
 
 ## Custom agents
 
@@ -136,7 +136,7 @@ Supported frontmatter:
 - `context: fresh | summary`
 - `workspace: shared | worktree`
 - `maxTurns`, `timeoutMs`
-- `skills` (parsed; explicit child skill-path loading is planned)
+- `skills` (exact discovered skill names; children load only those resolved paths)
 - `systemPromptMode: replace | append`
 - `inheritProjectContext`
 
@@ -165,7 +165,7 @@ With no configured ladder, behavior remains the same as before. `model: inherit`
 
 Compact run rows show the selected model and effort for that individual run. The fleet status intentionally omits a single model because concurrent children can use different configurations. Expanded output and `/subagents-fleet` retain the full model and usage details.
 
-The child transport passes the canonical model through `--model` and the clamped effort through `--thinking`. Run metadata records the requested model/effort and the model reported by Pi; a reported selected-model mismatch fails the run instead of silently falling back. Concrete upstream `responseModel` values are retained when providers expose them.
+The child transport passes the canonical model through `--model` and the clamped effort through `--thinking`. Explicit models, bare model resolution, profile settings, doctor diagnostics, and persisted workflow routing all honor the parent session's `ctx.scopedModels`; an empty Pi scope means unrestricted. Run metadata records the requested model/effort and the model reported by Pi; a reported selected-model mismatch fails the run instead of silently falling back. Concrete upstream `responseModel` values are retained when providers expose them.
 
 Children run with `--no-session` because this package owns their durable artifacts. Session-file-only usage trackers therefore see the parent session but not child requests; use the per-run status files or fleet totals for authoritative child usage.
 
@@ -266,6 +266,8 @@ Trusted project override: `.pi/pi-subagents.json`
 }
 ```
 
+Project TypeScript workflow confirmation is mandatory and cannot be disabled; `confirmProjectWorkflows` additionally controls previews for non-project `/workflow-run` command launches.
+
 Agent profile keys use the resolved agent definition name, not a descriptive run name. Project arrays replace user arrays for the same agent while leaving other user agent ladders intact. An explicit empty array disables routing for that agent. `/subagent-models` provides searchable model/agent pickers, can save either user settings or trusted-project settings, can remove a project override to resume user-level inheritance, and preserves unrelated configuration fields.
 
 ## Write safety and worktrees
@@ -297,6 +299,8 @@ Each run has a private directory:
 
 Model-visible output is capped; full output remains in `output.md`. JSON event lines and stderr are independently bounded.
 
+Pi 0.84 delta-only updates are assembled only for bounded live display; the final `message_end` remains authoritative. A zero-exit child still fails if it does not produce a final assistant result followed by `agent_settled`.
+
 After Pi exhausts its own provider-level retries, the extension retries a child process for recognized transient failures such as WebSocket disconnects, connection resets, rate limits, and 5xx responses. Retries use bounded exponential backoff, preserve cumulative usage/cost and attempt history, and stay within the original run timeout. To avoid repeating side effects, the extension does not restart a child after it has invoked `bash`, `edit`, or `write`. Set `maxRetries` to `0` globally or per run to disable process-level retries.
 
 The current session's active fleet is summarized in one compact status line. Workflow children are represented by their workflow rather than counted as standalone agents. Finished standalone runs remain visible for five minutes; workflow families remain visible together until five minutes after their last child activity, so the inspector keeps every agent run by a visible workflow. Open the fleet inspector with `/subagents-fleet`; with `pi-ui-customization` loaded, an empty editor can use `Up`/`Down` to select the footer status and `Enter` to open it. The extension opts this status into preserving its accent color during selection, so terminal inversion uses that color as the selected background. That navigation is owned by the editor only, so selectors and overlays keep normal ownership of their keys. The inspector groups workflow children beneath their parent, uses state-colored markers, and shows run metadata and scrollable output in a separate panel. Use `Up`/`Down` to select runs, `g`/`G` to jump, `j`/`k` to scroll output, `b` to background an eligible run, `r` to refresh, and `Esc`, `Ctrl+C`, or `q` to close. Detailed output remains available through the control tools. Set `showStatus` to `false` to hide the summary; the former `showWidget: false` setting is still honored for compatibility.
@@ -309,7 +313,15 @@ A full Pi process exit stops owned work. On the next startup, unfinished persist
 
 This release does not yet run a fully detached durable orchestrator daemon.
 
+## Failure semantics
+
+A direct workflow `ctx.agent()` failure rejects the workflow. `ctx.map()` and `ctx.parallel()` collect failed children as result values by default so successful siblings are retained; set `{ failFast: true }` to reject the group after in-flight work settles. Declared TypeBox workflow input/output schemas and agent-step JSON output schemas fail validation before the corresponding success is persisted. Automatic process retry remains disabled after a mutating tool call.
+
+Workflow definitions may declare `input` and `output` TypeBox schemas. Agent steps may declare `output`; the child is asked for JSON-only output and the parsed value is exposed as `result.value` after validation.
+
 ## Development
+
+Node.js 22.19 or newer is required.
 
 ```bash
 npm install

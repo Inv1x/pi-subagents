@@ -4,6 +4,20 @@
 	"description": "Focused subagents and durable programmatic workflows for Pi",
 	"type": "module",
 	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Inv1x/pi-subagents.git"
+	},
+	"homepage": "https://github.com/Inv1x/pi-subagents#readme",
+	"bugs": {
+		"url": "https://github.com/Inv1x/pi-subagents/issues"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
 	"keywords": [
 		"pi-package",
 		"pi-coding-agent",
@@ -17,6 +31,7 @@
 		"workflows",
 		"README.md",
 		"PLAN.md",
+		"CHANGELOG.md",
 		"LICENSE"
 	],
 	"exports": {
@@ -42,16 +57,17 @@
 		"check": "biome check .",
 		"check:fix": "biome check --write .",
 		"typecheck": "tsc --noEmit",
-		"test": "node --import jiti/register --test test/*.test.ts"
+		"test": "node --import jiti/register --test test/*.test.ts",
+		"prepack": "npm run check && npm run typecheck && npm test"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.5.5",
-		"@earendil-works/pi-agent-core": "^0.81.1",
-		"@earendil-works/pi-ai": "^0.81.1",
-		"@earendil-works/pi-coding-agent": "^0.81.1",
-		"@earendil-works/pi-tui": "^0.81.1",
+		"@earendil-works/pi-agent-core": "0.84.1",
+		"@earendil-works/pi-ai": "0.84.1",
+		"@earendil-works/pi-coding-agent": "0.84.1",
+		"@earendil-works/pi-tui": "0.84.1",
 		"@types/node": "^26.1.1",
-		"typebox": "^1.3.6",
+		"typebox": "1.3.7",
 		"typescript": "^7.0.2"
 	}
 }

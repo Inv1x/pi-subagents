@@ -1,9 +1,12 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	CONFIG_DIR_NAME,
 	getAgentDir,
+	loadSkills,
+	loadSkillsFromDir,
 	parseFrontmatter,
 } from "@earendil-works/pi-coding-agent";
 import { isThinkingLevel } from "./model-options.ts";
@@ -224,6 +227,44 @@ export function discoverAgents(
 
 export function packageRoot(): string {
 	return PACKAGE_ROOT;
+}
+
+/** Resolve declared skill names to exact files without enabling ambient child discovery. */
+export function resolveNamedSkillPaths(
+	names: readonly string[],
+	cwd: string,
+	projectTrusted: boolean,
+): string[] {
+	if (names.length === 0) return [];
+	const agentDir = getAgentDir();
+	const loaded = projectTrusted
+		? loadSkills({
+				cwd,
+				agentDir,
+				skillPaths: [],
+				includeDefaults: true,
+			})
+		: {
+				skills: [
+					...loadSkillsFromDir({
+						dir: path.join(agentDir, "skills"),
+						source: "user",
+					}).skills,
+					...loadSkillsFromDir({
+						dir: path.join(os.homedir(), ".agents", "skills"),
+						source: "user-agents",
+					}).skills,
+				],
+				diagnostics: [],
+			};
+	const byName = new Map(loaded.skills.map((skill) => [skill.name, skill]));
+	const missing = names.filter((name) => !byName.has(name));
+	if (missing.length > 0) {
+		throw new Error(
+			`Unknown declared skill${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}.`,
+		);
+	}
+	return names.map((name) => byName.get(name)?.filePath as string);
 }
 
 export function isWriteCapable(agent: AgentDefinition): boolean {

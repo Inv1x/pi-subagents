@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"fixture-incomplete","cwd":"/tmp"}
+{"type":"message_start","message":{"role":"assistant","content":[],"provider":"fixture","model":"model","stopReason":"stop","timestamp":0}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"not settled"}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"not settled"}],"usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"provider":"fixture","model":"model","stopReason":"stop","timestamp":0}}
+{"type":"agent_end","messages":[]}
