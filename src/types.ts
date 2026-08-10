@@ -131,7 +131,6 @@ export interface AgentRunRequest {
 	maxTurns?: number;
 	maxRetries?: number;
 	agentScope?: "user" | "project" | "both";
-	confirmProjectAgent?: boolean;
 }
 
 export interface ResolvedAgentRunRequest extends AgentRunRequest {

@@ -107,17 +107,26 @@ test("headless launches fail closed for project agents and workflow overrides", 
 		assert.ok(subagent?.execute);
 		assert.ok(workflow?.execute);
 		assert.ok(workflowControl?.execute);
+		const subagentProperties = (
+			subagent.parameters as { properties?: Record<string, unknown> }
+		).properties;
+		assert.equal(subagentProperties?.confirmProjectAgent, undefined);
 
-		await assert.rejects(
-			subagent.execute(
-				"agent-call",
-				{ agent: "reviewer", task: "review" },
-				undefined,
-				undefined,
-				ctx,
-			),
-			/interactive confirmation/,
-		);
+		for (const params of [
+			{ agent: "reviewer", task: "review" },
+			{ agent: "reviewer", task: "review", confirmProjectAgent: false },
+		]) {
+			await assert.rejects(
+				subagent.execute(
+					"agent-call",
+					params as never,
+					undefined,
+					undefined,
+					ctx,
+				),
+				/interactive confirmation/,
+			);
+		}
 		for (const workflowName of [
 			"parallel-review",
 			"user-review",

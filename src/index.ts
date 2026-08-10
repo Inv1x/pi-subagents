@@ -126,12 +126,6 @@ const SubagentRunParams = Type.Object(
 			}),
 		),
 		agentScope: Type.Optional(AgentScopeSchema),
-		confirmProjectAgent: Type.Optional(
-			Type.Boolean({
-				description:
-					"Prompt before executing a project-local agent; defaults to true",
-			}),
-		),
 	},
 	{ additionalProperties: false },
 );
@@ -710,8 +704,7 @@ export default function (pi: ExtensionAPI) {
 					`Unknown base agent '${requestedBase}'. Available: ${agents.map((agent) => agent.name).join(", ") || "none"}.`,
 				);
 			const requiresProjectAgentConfirmation =
-				definition.source === "project" &&
-				(params.confirmProjectAgent ?? config.confirmProjectAgents);
+				definition.source === "project" && config.confirmProjectAgents;
 			if (requiresProjectAgentConfirmation && !ctx.hasUI) {
 				throw new Error(
 					"Project-local agent execution requires an interactive confirmation.",

@@ -298,6 +298,31 @@ function assertSchema(
 	throw new Error(`${label} does not match its declared schema.`);
 }
 
+function canonicalizeJson(value: unknown, label: string): unknown {
+	let serialized: string | undefined;
+	try {
+		serialized = JSON.stringify(value);
+	} catch (error) {
+		throw new Error(
+			`${label} is not JSON-serializable: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (serialized === undefined)
+		throw new Error(`${label} is not JSON-serializable.`);
+	return JSON.parse(serialized);
+}
+
+function isWorkflowAgentResult(value: unknown): value is WorkflowAgentResult {
+	if (!value || typeof value !== "object") return false;
+	const result = value as Partial<WorkflowAgentResult>;
+	return (
+		typeof result.runId === "string" &&
+		typeof result.state === "string" &&
+		typeof result.output === "string" &&
+		Boolean(result.usage && typeof result.usage === "object")
+	);
+}
+
 function parseStructuredOutput(
 	output: string,
 	schema: TSchema,
@@ -432,10 +457,14 @@ export class WorkflowEngine {
 			workflow,
 			options,
 			controller,
-		).finally(() => {
-			options.signal?.removeEventListener("abort", parentAbort);
-			this.active.delete(record.id);
-		});
+		)
+			.catch((error) =>
+				this.settleUnexpectedFailure(record, snapshot, controller, error),
+			)
+			.finally(() => {
+				options.signal?.removeEventListener("abort", parentAbort);
+				this.active.delete(record.id);
+			});
 		this.active.set(record.id, { controller, promise });
 		if (options.background) {
 			void promise;
@@ -641,6 +670,9 @@ export class WorkflowEngine {
 					},
 				});
 				const result = asAgentResult(child);
+				step.state = child.state;
+				step.result = result;
+				step.error = child.error;
 				if (child.state === "succeeded" && spec.output) {
 					result.value = parseStructuredOutput(
 						result.output,
@@ -648,9 +680,6 @@ export class WorkflowEngine {
 						stepId,
 					);
 				}
-				step.state = child.state;
-				step.result = result;
-				step.error = child.error;
 				step.updatedAt = Date.now();
 				persistStep(step);
 				this.recalculateUsage(record.id);
@@ -745,26 +774,37 @@ export class WorkflowEngine {
 						return;
 					const spec = specs[index];
 					if (!spec) return;
+					const stepId = `${groupId}.${index}`;
 					try {
-						results[index] = await executeAgentStep(
-							`${groupId}.${index}`,
-							spec,
-						);
+						results[index] = await executeAgentStep(stepId, spec);
 					} catch (error) {
 						firstError ??= error;
-						results[index] = {
-							runId: "",
-							state: "failed",
-							output: error instanceof Error ? error.message : String(error),
-							usage: {
-								turns: 0,
-								input: 0,
-								output: 0,
-								cacheRead: 0,
-								cacheWrite: 0,
-								cost: 0,
-							},
-						};
+						const failedStep = snapshot.steps[stepId];
+						const persistedResult = failedStep?.result;
+						if (isWorkflowAgentResult(persistedResult)) {
+							results[index] = persistedResult;
+							continue;
+						}
+						const childRunId = failedStep?.childRunIds?.at(-1);
+						const child = childRunId
+							? workflowEngine.runtime.get(childRunId)
+							: undefined;
+						results[index] = child
+							? asAgentResult(child)
+							: {
+									runId: "",
+									state: "failed",
+									output:
+										error instanceof Error ? error.message : String(error),
+									usage: {
+										turns: 0,
+										input: 0,
+										output: 0,
+										cacheRead: 0,
+										cacheWrite: 0,
+										cost: 0,
+									},
+								};
 					}
 				}
 			});
@@ -780,7 +820,10 @@ export class WorkflowEngine {
 
 		try {
 			const returned = await workflow.definition.run(context, snapshot.input);
-			const result = explicitResult ?? returned;
+			const result = canonicalizeJson(
+				explicitResult ?? returned,
+				`Workflow '${workflow.definition.name}' output`,
+			);
 			assertSchema(
 				workflow.definition.output,
 				result,
@@ -817,6 +860,37 @@ export class WorkflowEngine {
 				output: failure.message,
 				activity: undefined,
 			});
+		}
+	}
+
+	private settleUnexpectedFailure(
+		record: RunRecord,
+		snapshot: WorkflowSnapshot,
+		controller: AbortController,
+		error: unknown,
+	): RunRecord {
+		const state: RunState = controller.signal.aborted ? "cancelled" : "failed";
+		const failure = stepError(error);
+		try {
+			this.setSnapshotState(snapshot, state);
+		} catch (persistenceError) {
+			console.error(
+				`[pi-subagents] Could not persist failed workflow snapshot ${record.id}:`,
+				persistenceError,
+			);
+		}
+		try {
+			return this.runtime.updateManagedRun(record.id, state, {
+				error: failure,
+				output: failure.message,
+				activity: undefined,
+			});
+		} catch (persistenceError) {
+			console.error(
+				`[pi-subagents] Could not persist failed workflow run ${record.id}:`,
+				persistenceError,
+			);
+			return { ...record, state, error: failure, output: failure.message };
 		}
 	}
 

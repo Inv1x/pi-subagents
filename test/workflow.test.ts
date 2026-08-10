@@ -422,3 +422,135 @@ test("workflow rejects invalid workspace before creating a child", async () => {
 		fs.rmSync(directory, { recursive: true, force: true });
 	}
 });
+
+test("background workflows durably fail for non-JSON results", async () => {
+	const directory = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-subagents-workflow-json-result-"),
+	);
+	const unhandled: unknown[] = [];
+	const onUnhandled = (reason: unknown) => unhandled.push(reason);
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		const runtime = new SubagentRuntime(
+			new RunStore(path.join(directory, "runs")),
+		);
+		const engine = new WorkflowEngine(runtime);
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
+		for (const [name, value] of [
+			["cyclic-result", cyclic],
+			["bigint-result", 1n],
+		] as const) {
+			const workflow: DiscoveredWorkflow = {
+				source: "user",
+				filePath: path.join(directory, `${name}.workflow.ts`),
+				definitionHash: `${name}-hash`,
+				definition: {
+					name,
+					description: "test",
+					run: () => value,
+				},
+			};
+			const started = await engine.start(
+				workflow,
+				{},
+				{
+					cwd: directory,
+					background: true,
+					resolveAgent: () => undefined,
+				},
+			);
+			const completed = await engine.wait(started.id, 5000);
+			assert.equal(completed.state, "failed");
+			assert.match(completed.error?.message ?? "", /not JSON-serializable/);
+			assert.equal(runtime.store.read(started.id)?.state, "failed");
+			const snapshot = runtime.store.readWorkflow(started.id);
+			assert.equal(snapshot?.state, "failed");
+			assert.equal(
+				Object.hasOwn(snapshot ?? {}, "result"),
+				false,
+				"invalid result must not poison the persisted snapshot",
+			);
+		}
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.deepEqual(unhandled, []);
+	} finally {
+		process.off("unhandledRejection", onUnhandled);
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("non-fail-fast maps preserve failed child diagnostics", async () => {
+	const directory = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-subagents-workflow-map-failure-"),
+	);
+	const script = path.join(directory, "mock-pi.mjs");
+	fs.writeFileSync(
+		script,
+		`#!/usr/bin/env node\nconst task=process.argv.at(-1);\nconst failing=task.includes('FAIL');\nconst message={role:'assistant',content:[{type:'text',text:failing?'FAILED_DIAGNOSTIC':'OK'}],usage:{input:failing?7:2,output:3,cost:{total:failing?0.07:0.02}},provider:'mock',model:'model',stopReason:failing?'error':'stop',timestamp:Date.now()};\nif(failing) message.errorMessage='child exploded';\nconsole.log(JSON.stringify({type:'message_end',message}));\nconsole.log(JSON.stringify({type:'agent_settled'}));\n`,
+	);
+	fs.chmodSync(script, 0o755);
+	const previous = process.env.PI_SUBAGENTS_PI_BIN;
+	process.env.PI_SUBAGENTS_PI_BIN = script;
+	try {
+		const runtime = new SubagentRuntime(
+			new RunStore(path.join(directory, "runs")),
+		);
+		runtime.configure({ ...DEFAULT_CONFIG, maxRetries: 0 });
+		const engine = new WorkflowEngine(runtime);
+		const agent = definition(script);
+		const workflow: DiscoveredWorkflow = {
+			source: "user",
+			filePath: path.join(directory, "map-failure.workflow.ts"),
+			definitionHash: "map-failure-hash",
+			definition: {
+				name: "map-failure",
+				description: "test",
+				async run(ctx) {
+					return ctx.map(
+						"checks",
+						["PASS", "FAIL"],
+						(task) => ({ agent: "mock", task }),
+						{ concurrency: 2, failFast: false },
+					);
+				},
+			},
+		};
+		const completed = await engine.start(
+			workflow,
+			{},
+			{
+				cwd: directory,
+				background: false,
+				resolveAgent: (name) => (name === "mock" ? agent : undefined),
+			},
+		);
+		assert.equal(completed.state, "succeeded");
+		const children = runtime
+			.list(100)
+			.filter((record) => record.parentRunId === completed.id);
+		const failedChild = children.find((record) => record.state === "failed");
+		assert.ok(failedChild);
+		const snapshot = runtime.store.readWorkflow(completed.id);
+		const results = snapshot?.steps.checks?.result as
+			| Array<{
+					runId: string;
+					state: string;
+					output: string;
+					outputArtifact?: string;
+					usage: { input: number; output: number; cost: number };
+			  }>
+			| undefined;
+		const failedResult = results?.find((result) => result.state === "failed");
+		assert.ok(failedResult);
+		assert.equal(failedResult.runId, failedChild.id);
+		assert.equal(failedResult.outputArtifact, failedChild.outputArtifact);
+		assert.equal(failedResult.usage.input, 7);
+		assert.equal(failedResult.usage.output, 3);
+		assert.equal(failedResult.usage.cost, 0.07);
+	} finally {
+		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
+		else process.env.PI_SUBAGENTS_PI_BIN = previous;
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
