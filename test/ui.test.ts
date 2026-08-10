@@ -108,10 +108,21 @@ test("launch and control renderers stay compact", () => {
 		.render(120)
 		.join("\n");
 	assert.match(rendered, /scout.*succeeded/);
-	assert.match(rendered, /# Plan/);
-	assert.doesNotMatch(rendered, /runId/);
+	assert.doesNotMatch(rendered, /# Plan|focused work|runId|Ctrl\+O/);
 	assert.match(rendered, /gpt-5\.6-sol.*high effort/);
 	assert.doesNotMatch(rendered, /contextTokens/);
+
+	const expanded = renderControlResult(
+		{
+			content: [{ type: "text", text: completed.output }],
+			details: { runs: [completed] },
+		},
+		{ expanded: true },
+		theme,
+	)
+		.render(120)
+		.join("\n");
+	assert.doesNotMatch(expanded, /# Plan|focused work|runId|Ctrl\+O/);
 });
 
 test("running tool rows update elapsed time on natural renders without forced ticks", (context) => {
@@ -467,6 +478,15 @@ test("workflow children are grouped under workflow status, not agent counts", ()
 		statuses.at(-1),
 		"1 workflow finished · $0.12 · /subagents-fleet",
 	);
+
+	child.endedAt = old;
+	child.updatedAt = Date.now();
+	listener?.({ run: { ...child }, previousState: "succeeded" });
+	assert.equal(
+		statuses.at(-1),
+		undefined,
+		"post-completion metadata updates must not extend the five-minute window",
+	);
 	uninstall();
 });
 
@@ -683,6 +703,11 @@ test("fleet arrows select agents while j/k exclusively scroll output", async () 
 	const beta = run({
 		id: "agent_beta",
 		agent: "beta",
+		task: "Inspect the beta subsystem",
+		difficulty: 5,
+		outputArtifact: "/runs/beta/output.md",
+		transcriptArtifact: "/runs/beta/transcript.log",
+		patchArtifact: "/runs/beta/changes.patch",
 		output: Array.from({ length: 30 }, (_, index) => `beta line ${index}`).join(
 			"\n",
 		),
@@ -696,6 +721,16 @@ test("fleet arrows select agents while j/k exclusively scroll output", async () 
 		terminal: { rows: 30 },
 		requestRender: () => {},
 	} as unknown as TUI;
+	const conflictingKeybindings = {
+		getKeys: (binding: Parameters<KeybindingsManager["getKeys"]>[0]) =>
+			fleetKeybindings.getKeys(binding),
+		matches: (
+			data: string,
+			binding: Parameters<KeybindingsManager["matches"]>[1],
+		) =>
+			(data === "\u001b[106u" && binding === "tui.select.down") ||
+			fleetKeybindings.matches(data, binding),
+	} as unknown as KeybindingsManager;
 	const handle = {
 		hide: () => {},
 		setHidden: () => {},
@@ -718,7 +753,7 @@ test("fleet arrows select agents while j/k exclusively scroll output", async () 
 				) => Component,
 				options: { onHandle?: (overlayHandle: OverlayHandle) => void },
 			) => {
-				component = factory(tui, theme, fleetKeybindings, () => {});
+				component = factory(tui, theme, conflictingKeybindings, () => {});
 				options.onHandle?.(handle);
 				return undefined;
 			},
@@ -735,8 +770,19 @@ test("fleet arrows select agents while j/k exclusively scroll output", async () 
 	assert.match(render(), /Esc\/Ctrl\+C\/q close/);
 	assert.doesNotMatch(render(), /PgUp|PgDn|\besc\b|\bescape\b/);
 
+	component?.handleInput?.("\u001b[106u");
+	assert.match(render(), /alpha · agent/);
+	assert.doesNotMatch(render(), /Run\s+agent_alpha/);
+	component?.handleInput?.("\u001b[107u");
+	assert.match(render(), /Run\s+agent_alpha/);
+
 	component?.handleInput?.("\u001b[B");
 	assert.match(render(), /beta · agent/);
+	assert.match(render(), /Output\s+\/runs\/beta\/output\.md/);
+	assert.match(render(), /Transcript\s*\/runs\/beta\/transcript\.log/);
+	assert.match(render(), /Patch\s+\/runs\/beta\/changes\.patch/);
+	assert.match(render(), /Inspect the beta subsystem/);
+	assert.doesNotMatch(render(), /Difficulty/);
 	component?.handleInput?.("j");
 	assert.doesNotMatch(render(), /Run\s+agent_beta/);
 	assert.match(render(), /Kind\s+agent/);

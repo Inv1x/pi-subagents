@@ -152,7 +152,6 @@ export interface TransportEvent {
 	type:
 		| "started"
 		| "activity"
-		| "assistant"
 		| "usage"
 		| "retry"
 		| "settled"
@@ -218,7 +217,7 @@ export interface WorkflowStepRecord {
 export interface WorkflowRoutingSnapshot {
 	defaultModel?: string;
 	defaultThinking?: ThinkingLevel;
-	/** Undefined means the parent session was not model-scoped. */
+	/** @deprecated Read for compatibility; model routing ignores old session scopes. */
 	scopedModels?: string[];
 	agentModels: Record<string, AgentModelProfile[]>;
 	agents: Record<string, AgentDefinition>;
@@ -244,4 +243,9 @@ export interface WorkflowSnapshot {
 export interface RunUpdate {
 	run: RunRecord;
 	previousState?: RunState;
+}
+
+/** Return a detached record so callers cannot mutate runtime-owned nested state. */
+export function snapshotRunRecord(record: RunRecord): RunRecord {
+	return structuredClone(record);
 }

@@ -1,7 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Message } from "@earendil-works/pi-ai";
 import { createByteTail, createLineReader, truncateUtf8 } from "./protocol.ts";
 import type {
 	ResolvedAgentRunRequest,
@@ -10,8 +9,6 @@ import type {
 	TransportResult,
 	UsageStats,
 } from "./types.ts";
-
-export const MAX_LIVE_TEXT_SLOTS = 256;
 
 function emptyUsage(): UsageStats {
 	return {
@@ -51,14 +48,107 @@ function sameSelectedModel(requested: string, reported: string): boolean {
 	return false;
 }
 
-function finalText(message: Message): string {
-	if (message.role !== "assistant") return "";
+interface AssistantPayload {
+	content: Array<Record<string, unknown>>;
+	usage?: {
+		input?: number;
+		output?: number;
+		cacheRead?: number;
+		cacheWrite?: number;
+		totalTokens?: number;
+		cost?: { total?: number };
+	};
+	provider?: string;
+	model?: string;
+	responseModel?: string;
+	stopReason?: string;
+	errorMessage?: string;
+}
+
+function optionalString(value: unknown, field: string): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string")
+		throw new Error(`${field} must be a string when present`);
+	return value;
+}
+
+function optionalNumber(value: unknown, field: string): number | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
+		throw new Error(`${field} must be a finite non-negative number`);
+	return value;
+}
+
+function parseAssistantPayload(value: unknown): AssistantPayload | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value))
+		throw new Error("message must be an object");
+	const raw = value as Record<string, unknown>;
+	if (raw.role !== "assistant") return undefined;
+	if (!Array.isArray(raw.content))
+		throw new Error("assistant content must be an array");
+	const content = raw.content.map((part, index) => {
+		if (!part || typeof part !== "object" || Array.isArray(part))
+			throw new Error(`assistant content[${index}] must be an object`);
+		const item = part as Record<string, unknown>;
+		if (typeof item.type !== "string")
+			throw new Error(`assistant content[${index}].type must be a string`);
+		if (item.type === "text" && typeof item.text !== "string")
+			throw new Error(`assistant content[${index}].text must be a string`);
+		return item;
+	});
+	let usage: AssistantPayload["usage"];
+	if (raw.usage !== undefined) {
+		if (!raw.usage || typeof raw.usage !== "object" || Array.isArray(raw.usage))
+			throw new Error("assistant usage must be an object");
+		const candidate = raw.usage as Record<string, unknown>;
+		let cost: { total?: number } | undefined;
+		if (candidate.cost !== undefined) {
+			if (
+				!candidate.cost ||
+				typeof candidate.cost !== "object" ||
+				Array.isArray(candidate.cost)
+			)
+				throw new Error("assistant usage.cost must be an object");
+			cost = {
+				total: optionalNumber(
+					(candidate.cost as Record<string, unknown>).total,
+					"assistant usage.cost.total",
+				),
+			};
+		}
+		usage = {
+			input: optionalNumber(candidate.input, "assistant usage.input"),
+			output: optionalNumber(candidate.output, "assistant usage.output"),
+			cacheRead: optionalNumber(
+				candidate.cacheRead,
+				"assistant usage.cacheRead",
+			),
+			cacheWrite: optionalNumber(
+				candidate.cacheWrite,
+				"assistant usage.cacheWrite",
+			),
+			totalTokens: optionalNumber(
+				candidate.totalTokens,
+				"assistant usage.totalTokens",
+			),
+			...(cost ? { cost } : {}),
+		};
+	}
+	return {
+		content,
+		...(usage ? { usage } : {}),
+		provider: optionalString(raw.provider, "assistant provider"),
+		model: optionalString(raw.model, "assistant model"),
+		responseModel: optionalString(raw.responseModel, "assistant responseModel"),
+		stopReason: optionalString(raw.stopReason, "assistant stopReason"),
+		errorMessage: optionalString(raw.errorMessage, "assistant errorMessage"),
+	};
+}
+
+function finalText(message: AssistantPayload): string {
 	return message.content
-		.filter(
-			(part): part is Extract<typeof part, { type: "text" }> =>
-				part.type === "text",
-		)
-		.map((part) => part.text)
+		.filter((part) => part.type === "text")
+		.map((part) => part.text as string)
 		.join("\n")
 		.trim();
 }
@@ -93,9 +183,15 @@ async function terminateProcessTree(
 		});
 		return;
 	}
-	try {
-		process.kill(-pid, "SIGTERM");
-	} catch {
+	const signalGroup = (signal: NodeJS.Signals): boolean => {
+		try {
+			process.kill(-pid, signal);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	if (!signalGroup("SIGTERM")) {
 		try {
 			processHandle.kill("SIGTERM");
 		} catch {
@@ -103,20 +199,32 @@ async function terminateProcessTree(
 		}
 	}
 	await new Promise((resolve) => setTimeout(resolve, graceMs));
+	// Check the process group, not only its leader: the leader may have exited
+	// while a grandchild inherited the detached group.
+	let groupAlive = false;
 	try {
-		process.kill(pid, 0);
+		process.kill(-pid, 0);
+		groupAlive = true;
 	} catch {
-		return;
+		/* process group exited */
 	}
-	try {
-		process.kill(-pid, "SIGKILL");
-	} catch {
+	if (groupAlive) signalGroup("SIGKILL");
+	else {
 		try {
 			processHandle.kill("SIGKILL");
 		} catch {
 			/* already exited */
 		}
 	}
+	if (processHandle.exitCode === null && processHandle.signalCode === null)
+		await new Promise<void>((resolve) => {
+			const timer = setTimeout(resolve, 1000);
+			timer.unref?.();
+			processHandle.once("close", () => {
+				clearTimeout(timer);
+				resolve();
+			});
+		});
 }
 
 function toolActivity(event: Record<string, unknown>): {
@@ -210,6 +318,10 @@ export async function runCliAgent(
 	const transcript: string[] = [];
 	const stderr = createByteTail();
 	let child: ChildProcess | undefined;
+	let termination: Promise<void> | undefined;
+	const terminateChild = () => {
+		if (child) termination ??= terminateProcessTree(child);
+	};
 	let timedOut = false;
 	let maxTurnsExceeded = false;
 	let cancelled = false;
@@ -220,42 +332,22 @@ export async function runCliAgent(
 	let sawAuthoritativeFinal = false;
 	let sawSettled = false;
 	let settlementHadFinal = false;
-	const liveText = new Map<number, string>();
-	const liveIndexes: number[] = [];
-	let liveBytes = 0;
-	let liveTruncated = false;
-
-	const insertLiveIndex = (index: number) => {
-		let low = 0;
-		let high = liveIndexes.length;
-		while (low < high) {
-			const middle = (low + high) >>> 1;
-			if ((liveIndexes[middle] ?? 0) < index) low = middle + 1;
-			else high = middle;
-		}
-		liveIndexes.splice(low, 0, index);
-	};
-	const emitLivePreview = () => {
-		const combined = liveIndexes
-			.map((index) => liveText.get(index) ?? "")
-			.join("\n");
-		options.onEvent?.({
-			type: "assistant",
-			data: {
-				text: liveTruncated
-					? `${combined}\n\n[Live output truncated; message_end remains authoritative.]`
-					: combined,
-				partial: true,
-				truncated: liveTruncated,
-			},
-		});
-	};
 
 	const remember = (line: string) => {
 		transcript.push(line);
 		if (transcript.length > options.transcriptMaxEvents)
 			transcript.splice(0, transcript.length - options.transcriptMaxEvents);
 	};
+
+	const childEnv = { ...process.env };
+	for (const key of [
+		"PI_SESSION_ID",
+		"PI_SESSION_FILE",
+		"PI_PROVIDER",
+		"PI_MODEL",
+		"PI_REASONING_LEVEL",
+	])
+		delete childEnv[key];
 
 	const exitCode = await new Promise<number>((resolve) => {
 		let resolved = false;
@@ -271,7 +363,7 @@ export async function runCliAgent(
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
 			env: {
-				...process.env,
+				...childEnv,
 				PI_SUBAGENT_DEPTH: "1",
 				PI_SUBAGENT_PARENT_RUN: options.runId,
 			},
@@ -289,65 +381,6 @@ export async function runCliAgent(
 					return;
 				}
 				const type = typeof event.type === "string" ? event.type : "unknown";
-				if (type === "message_start") {
-					liveText.clear();
-					liveIndexes.length = 0;
-					liveBytes = 0;
-					liveTruncated = false;
-				}
-				if (
-					type === "message_update" &&
-					event.assistantMessageEvent &&
-					typeof event.assistantMessageEvent === "object"
-				) {
-					const deltaEvent = event.assistantMessageEvent as Record<
-						string,
-						unknown
-					>;
-					if (
-						deltaEvent.type === "text_delta" &&
-						Number.isSafeInteger(deltaEvent.contentIndex) &&
-						(deltaEvent.contentIndex as number) >= 0 &&
-						typeof deltaEvent.delta === "string" &&
-						deltaEvent.delta.length > 0 &&
-						!liveTruncated
-					) {
-						const index = deltaEvent.contentIndex as number;
-						const existing = liveText.get(index);
-						if (
-							existing === undefined &&
-							liveText.size >= MAX_LIVE_TEXT_SLOTS
-						) {
-							liveTruncated = true;
-							emitLivePreview();
-						} else {
-							const separatorBytes =
-								existing === undefined && liveText.size > 0 ? 1 : 0;
-							const remaining = Math.max(
-								0,
-								options.resultMaxBytes - liveBytes - separatorBytes,
-							);
-							const boundedDelta = truncateUtf8(deltaEvent.delta, remaining);
-							const retainedDelta = boundedDelta.truncated
-								? boundedDelta.text.slice(
-										0,
-										boundedDelta.text.lastIndexOf("\n\n[Output truncated:"),
-									)
-								: boundedDelta.text;
-							if (retainedDelta) {
-								if (existing === undefined) {
-									insertLiveIndex(index);
-									liveText.set(index, retainedDelta);
-								} else {
-									liveText.set(index, `${existing}${retainedDelta}`);
-								}
-								liveBytes += separatorBytes + Buffer.byteLength(retainedDelta);
-							}
-							liveTruncated = boundedDelta.truncated;
-							if (retainedDelta || liveTruncated) emitLivePreview();
-						}
-					}
-				}
 				if (type === "tool_execution_start") {
 					const activity = toolActivity(event);
 					remember(`tool: ${activity.message}`);
@@ -380,29 +413,30 @@ export async function runCliAgent(
 						`retry: ${event.success === true ? "recovered" : "exhausted"}${typeof event.finalError === "string" ? `: ${event.finalError}` : ""}`,
 					);
 				}
-				if (
-					type === "message_end" &&
-					event.message &&
-					typeof event.message === "object"
-				) {
-					const message = event.message as Message;
-					if (message.role === "assistant") {
-						usage.turns++;
-						const assistant = message as Message & {
-							usage?: {
-								input?: number;
-								output?: number;
-								cacheRead?: number;
-								cacheWrite?: number;
-								totalTokens?: number;
-								cost?: { total?: number };
-							};
-							provider?: string;
-							model?: string;
-							responseModel?: string;
-							stopReason?: string;
-							errorMessage?: string;
+				if (type === "message_end") {
+					let assistant: AssistantPayload | undefined;
+					try {
+						assistant = parseAssistantPayload(event.message);
+					} catch (error) {
+						const reason =
+							error instanceof Error ? error.message : String(error);
+						protocolError = {
+							code: "malformed_message_end",
+							message: `Malformed assistant message_end: ${reason}.`,
+							retryable: false,
 						};
+						remember(`protocol: ${protocolError.message}`);
+						options.onEvent?.({
+							type: "protocol_error",
+							data: {
+								code: protocolError.code,
+								message: protocolError.message,
+							},
+						});
+						terminateChild();
+					}
+					if (assistant) {
+						usage.turns++;
 						if (assistant.usage) {
 							usage.input += assistant.usage.input ?? 0;
 							usage.output += assistant.usage.output ?? 0;
@@ -438,27 +472,21 @@ export async function runCliAgent(
 									reportedModel: selectedModel,
 								},
 							});
-							if (child) void terminateProcessTree(child);
+							terminateChild();
 						}
 						modelName = responseModel ?? selectedModel ?? modelName;
 						if (assistant.stopReason === "error")
 							stopError =
 								assistant.errorMessage ?? "The model reported an error.";
 						else stopError = undefined;
-						const text = finalText(message);
+						const text = finalText(assistant);
 						const terminalAssistant =
 							assistant.stopReason === "stop" ||
 							assistant.stopReason === "end" ||
 							assistant.stopReason === "length";
 						sawAuthoritativeFinal = terminalAssistant && Boolean(text);
 						if (terminalAssistant) authoritativeOutput = text;
-						if (text) {
-							remember(`assistant: ${text.slice(0, 500)}`);
-							options.onEvent?.({
-								type: "assistant",
-								data: { text, partial: false },
-							});
-						}
+						if (text) remember(`assistant: ${text.slice(0, 500)}`);
 						options.onEvent?.({
 							type: "usage",
 							data: {
@@ -473,7 +501,7 @@ export async function runCliAgent(
 							assistant.stopReason === "stop" || assistant.stopReason === "end";
 						if (usage.turns >= request.maxTurns && !terminalStop && child) {
 							maxTurnsExceeded = true;
-							void terminateProcessTree(child);
+							terminateChild();
 						}
 					}
 				}
@@ -490,7 +518,7 @@ export async function runCliAgent(
 					retryable: false,
 				};
 				options.onEvent?.({ type: "protocol_error", data: { ...error } });
-				if (child) void terminateProcessTree(child);
+				terminateChild();
 			},
 		});
 
@@ -508,13 +536,13 @@ export async function runCliAgent(
 
 		const timeout = setTimeout(() => {
 			timedOut = true;
-			if (child) void terminateProcessTree(child);
+			terminateChild();
 		}, request.timeoutMs);
 		timeout.unref?.();
 
 		const abort = () => {
 			cancelled = true;
-			if (child) void terminateProcessTree(child);
+			terminateChild();
 		};
 		if (options.signal.aborted) abort();
 		else options.signal.addEventListener("abort", abort, { once: true });
@@ -525,6 +553,7 @@ export async function runCliAgent(
 			options.signal.removeEventListener("abort", abort);
 		});
 	});
+	if (termination) await termination;
 
 	const fullOutput = authoritativeOutput;
 	const bounded = truncateUtf8(fullOutput, options.resultMaxBytes);

@@ -19,7 +19,7 @@ import type {
 	TransportResult,
 	UsageStats,
 } from "./types.ts";
-import { TERMINAL_STATES } from "./types.ts";
+import { snapshotRunRecord, TERMINAL_STATES } from "./types.ts";
 import { createWorktree, type WorktreeHandle } from "./worktree.ts";
 
 interface Deferred<T> {
@@ -149,54 +149,60 @@ export class SubagentRuntime {
 		return () => this.listeners.delete(listener);
 	}
 
-	list(limit = 100): RunRecord[] {
-		const persisted = this.store.list(limit * 2);
-		for (const record of persisted)
+	private loadPersisted(limit: number): void {
+		for (const record of this.store.list(limit))
 			if (!this.records.has(record.id)) this.records.set(record.id, record);
+	}
+
+	private getInternal(
+		idOrPrefix: string,
+		sessionId?: string,
+	): RunRecord | undefined {
+		const direct = this.records.get(idOrPrefix) ?? this.store.read(idOrPrefix);
+		if (direct) {
+			this.records.set(direct.id, direct);
+			return sessionId === undefined || direct.sessionId === sessionId
+				? direct
+				: undefined;
+		}
+		this.loadPersisted(500);
+		const matches = [...this.records.values()].filter(
+			(record) =>
+				record.id.startsWith(idOrPrefix) &&
+				(sessionId === undefined || record.sessionId === sessionId),
+		);
+		if (matches.length > 1)
+			throw new Error(
+				`Ambiguous run id prefix '${idOrPrefix}'. Matches: ${matches.map((record) => record.id).join(", ")}`,
+			);
+		return matches[0];
+	}
+
+	list(limit = 100): RunRecord[] {
+		this.loadPersisted(limit * 2);
 		return [...this.records.values()]
 			.sort((a, b) => b.updatedAt - a.updatedAt)
-			.slice(0, limit);
+			.slice(0, limit)
+			.map(snapshotRunRecord);
 	}
 
 	listForSession(sessionId: string, limit = 100): RunRecord[] {
-		for (const record of this.store.list(Number.MAX_SAFE_INTEGER))
-			if (!this.records.has(record.id)) this.records.set(record.id, record);
+		this.loadPersisted(Number.MAX_SAFE_INTEGER);
 		return [...this.records.values()]
 			.filter((record) => record.sessionId === sessionId)
 			.sort((a, b) => b.updatedAt - a.updatedAt)
-			.slice(0, limit);
+			.slice(0, limit)
+			.map(snapshotRunRecord);
 	}
 
 	get(idOrPrefix: string): RunRecord | undefined {
-		const direct = this.records.get(idOrPrefix) ?? this.store.read(idOrPrefix);
-		if (direct) {
-			this.records.set(direct.id, direct);
-			return direct;
-		}
-		const matches = this.list(500).filter((record) =>
-			record.id.startsWith(idOrPrefix),
-		);
-		if (matches.length > 1)
-			throw new Error(
-				`Ambiguous run id prefix '${idOrPrefix}'. Matches: ${matches.map((record) => record.id).join(", ")}`,
-			);
-		return matches[0];
+		const record = this.getInternal(idOrPrefix);
+		return record ? snapshotRunRecord(record) : undefined;
 	}
 
 	getForSession(idOrPrefix: string, sessionId: string): RunRecord | undefined {
-		const direct = this.records.get(idOrPrefix) ?? this.store.read(idOrPrefix);
-		if (direct) {
-			this.records.set(direct.id, direct);
-			return direct.sessionId === sessionId ? direct : undefined;
-		}
-		const matches = this.listForSession(sessionId, 500).filter((record) =>
-			record.id.startsWith(idOrPrefix),
-		);
-		if (matches.length > 1)
-			throw new Error(
-				`Ambiguous run id prefix '${idOrPrefix}'. Matches: ${matches.map((record) => record.id).join(", ")}`,
-			);
-		return matches[0];
+		const record = this.getInternal(idOrPrefix, sessionId);
+		return record ? snapshotRunRecord(record) : undefined;
 	}
 
 	getActivities(runIdValue: string): string[] {
@@ -232,7 +238,7 @@ export class SubagentRuntime {
 				contextTokens: 0,
 			},
 			metadata: {
-				input,
+				input: structuredClone(input),
 				ownerPid: process.pid,
 				...(options.background
 					? { completionPending: true, completionGeneration: 1 }
@@ -241,8 +247,8 @@ export class SubagentRuntime {
 		};
 		this.records.set(id, record);
 		this.store.create(record);
-		this.emit({ run: { ...record } });
-		return record;
+		this.emit({ run: record });
+		return snapshotRunRecord(record);
 	}
 
 	updateManagedRun(
@@ -250,17 +256,17 @@ export class SubagentRuntime {
 		state: RunState,
 		patch: Partial<RunRecord> = {},
 	): RunRecord {
-		const record = this.get(runIdValue);
+		const record = this.getInternal(runIdValue);
 		if (!record) throw new Error(`Run not found: ${runIdValue}`);
 		this.transition(record, state, patch);
-		return { ...record };
+		return snapshotRunRecord(record);
 	}
 
 	patchManagedRun(runIdValue: string, patch: Partial<RunRecord>): RunRecord {
-		const record = this.get(runIdValue);
+		const record = this.getInternal(runIdValue);
 		if (!record) throw new Error(`Run not found: ${runIdValue}`);
 		this.patch(record, patch);
-		return { ...record };
+		return snapshotRunRecord(record);
 	}
 
 	async startAgent(
@@ -318,12 +324,12 @@ export class SubagentRuntime {
 		this.records.set(id, record);
 		this.store.create(record);
 		this.activities.set(id, []);
-		options.onCreated?.({ ...record });
+		options.onCreated?.(snapshotRunRecord(record));
 		const completion = deferred<RunRecord>();
 		this.completions.set(id, completion);
 		const detachment = deferred<void>();
 		this.detachments.set(id, detachment);
-		this.emit({ run: { ...record } });
+		this.emit({ run: record });
 
 		const controller = new AbortController();
 		const parentAbort = () => {
@@ -368,15 +374,16 @@ export class SubagentRuntime {
 				options.signal?.removeEventListener("abort", parentAbort);
 				this.controllers.delete(id);
 				this.detachments.delete(id);
-				completion.resolve({ ...record });
+				completion.resolve(snapshotRunRecord(record));
+				this.completions.delete(id);
 			});
 
 		if (options.background) {
 			void execution;
-			return { ...record };
+			return snapshotRunRecord(record);
 		}
 		await Promise.race([execution, detachment.promise]);
-		return { ...record };
+		return snapshotRunRecord(record);
 	}
 
 	async wait(
@@ -384,15 +391,16 @@ export class SubagentRuntime {
 		timeoutMs = 30 * 60_000,
 		signal?: AbortSignal,
 	): Promise<RunRecord> {
-		const record = this.get(idOrPrefix);
+		const record = this.getInternal(idOrPrefix);
 		if (!record) throw new Error(`Run not found: ${idOrPrefix}`);
-		if (TERMINAL_STATES.has(record.state)) return record;
+		if (TERMINAL_STATES.has(record.state)) return snapshotRunRecord(record);
 		const abortMessage = `Stopped waiting for ${record.id}; the run continues.`;
 		const active = this.completions.get(record.id);
 		if (active) {
 			return observe(active.promise, {
 				timeoutMs,
-				onTimeout: () => ({ ...(this.get(record.id) ?? record) }),
+				onTimeout: () =>
+					snapshotRunRecord(this.getInternal(record.id) ?? record),
 				signal,
 				abortMessage,
 			});
@@ -409,40 +417,44 @@ export class SubagentRuntime {
 			const latest = this.store.read(record.id);
 			if (latest) {
 				this.records.set(latest.id, latest);
-				if (TERMINAL_STATES.has(latest.state)) return latest;
+				if (TERMINAL_STATES.has(latest.state)) return snapshotRunRecord(latest);
 			}
 		}
-		return { ...(this.store.read(record.id) ?? this.get(record.id) ?? record) };
+		return snapshotRunRecord(
+			this.store.read(record.id) ?? this.getInternal(record.id) ?? record,
+		);
 	}
 
 	markCompletionEnqueued(idOrPrefix: string, sessionId: string): RunRecord {
-		const record = this.getForSession(idOrPrefix, sessionId);
+		const record = this.getInternal(idOrPrefix, sessionId);
 		if (!record) throw new Error(`Run not found: ${idOrPrefix}`);
 		if (
 			record.metadata?.completionDeliveredAt ||
 			record.metadata?.completionEnqueuedAt
 		)
-			return record;
+			return snapshotRunRecord(record);
 		this.patch(record, {
 			metadata: { ...record.metadata, completionEnqueuedAt: now() },
 		});
-		return { ...record };
+		return snapshotRunRecord(record);
 	}
 
 	clearCompletionEnqueued(idOrPrefix: string, sessionId: string): RunRecord {
-		const record = this.getForSession(idOrPrefix, sessionId);
+		const record = this.getInternal(idOrPrefix, sessionId);
 		if (!record) throw new Error(`Run not found: ${idOrPrefix}`);
-		if (!record.metadata?.completionEnqueuedAt) return record;
+		if (!record.metadata?.completionEnqueuedAt)
+			return snapshotRunRecord(record);
 		this.patch(record, {
 			metadata: { ...record.metadata, completionEnqueuedAt: undefined },
 		});
-		return { ...record };
+		return snapshotRunRecord(record);
 	}
 
 	markCompletionDelivered(idOrPrefix: string, sessionId: string): RunRecord {
-		const record = this.getForSession(idOrPrefix, sessionId);
+		const record = this.getInternal(idOrPrefix, sessionId);
 		if (!record) throw new Error(`Run not found: ${idOrPrefix}`);
-		if (record.metadata?.completionDeliveredAt) return record;
+		if (record.metadata?.completionDeliveredAt)
+			return snapshotRunRecord(record);
 		this.patch(record, {
 			metadata: {
 				...record.metadata,
@@ -450,19 +462,18 @@ export class SubagentRuntime {
 				completionDeliveredAt: now(),
 			},
 		});
-		return { ...record };
+		return snapshotRunRecord(record);
 	}
 
 	background(idOrPrefix: string, sessionId?: string): RunRecord {
-		const record = sessionId
-			? this.getForSession(idOrPrefix, sessionId)
-			: this.get(idOrPrefix);
+		const record = this.getInternal(idOrPrefix, sessionId);
 		if (!record) throw new Error(`Run not found: ${idOrPrefix}`);
 		if (record.kind !== "agent" || record.parentRunId)
 			throw new Error(
 				"Only standalone subagents can be moved to the background.",
 			);
-		if (TERMINAL_STATES.has(record.state) || record.background) return record;
+		if (TERMINAL_STATES.has(record.state) || record.background)
+			return snapshotRunRecord(record);
 		if (!this.controllers.has(record.id))
 			throw new Error(
 				`Run ${record.id} is not owned by this process and cannot be backgrounded safely.`,
@@ -483,13 +494,13 @@ export class SubagentRuntime {
 			reason: "user_request",
 		});
 		this.detachments.get(record.id)?.resolve();
-		return { ...record };
+		return snapshotRunRecord(record);
 	}
 
 	stop(idOrPrefix: string, reason = "Stopped by user"): RunRecord {
-		const record = this.get(idOrPrefix);
+		const record = this.getInternal(idOrPrefix);
 		if (!record) throw new Error(`Run not found: ${idOrPrefix}`);
-		if (TERMINAL_STATES.has(record.state)) return record;
+		if (TERMINAL_STATES.has(record.state)) return snapshotRunRecord(record);
 		const controller = this.controllers.get(record.id);
 		if (!controller)
 			throw new Error(
@@ -499,12 +510,16 @@ export class SubagentRuntime {
 		this.store.appendEvent(record.id, "run.stop_requested", record.state, {
 			reason,
 		});
-		return { ...record };
+		return snapshotRunRecord(record);
 	}
 
-	shutdown(): void {
+	async shutdown(): Promise<void> {
+		const pending = [...this.completions.values()].map(
+			(completion) => completion.promise,
+		);
 		for (const [id, controller] of this.controllers)
 			controller.abort(new Error(`Parent process shutting down (${id})`));
+		await Promise.allSettled(pending);
 	}
 
 	private reconcileStartup(): void {
@@ -702,19 +717,6 @@ export class SubagentRuntime {
 			});
 			return;
 		}
-		if (
-			event.type === "assistant" &&
-			event.data?.partial === true &&
-			typeof event.data.text === "string"
-		) {
-			const tail = event.data.text.replace(/\s+/g, " ").trim().slice(-160);
-			if (tail) {
-				this.patch(record, {
-					activity: { message: `responding: ${tail}`, updatedAt: now() },
-				});
-			}
-			return;
-		}
 		if (event.type === "usage" && event.data) {
 			this.patch(record, {
 				usage: {
@@ -806,7 +808,7 @@ export class SubagentRuntime {
 			!resumableWorkflow
 		)
 			return;
-		Object.assign(record, patch, { state, updatedAt: now() });
+		Object.assign(record, structuredClone(patch), { state, updatedAt: now() });
 		if (resumableWorkflow) record.endedAt = undefined;
 		if (TERMINAL_STATES.has(state)) record.endedAt ??= record.updatedAt;
 		this.store.write(record);
@@ -816,19 +818,24 @@ export class SubagentRuntime {
 			state,
 			record.error ? { error: record.error } : undefined,
 		);
-		this.emit({ run: { ...record }, previousState });
+		this.emit({ run: record, previousState });
 	}
 
 	private patch(record: RunRecord, patch: Partial<RunRecord>): void {
-		Object.assign(record, patch, { updatedAt: now() });
+		Object.assign(record, structuredClone(patch), { updatedAt: now() });
 		this.store.write(record);
-		this.emit({ run: { ...record } });
+		this.emit({ run: record });
 	}
 
 	private emit(update: RunUpdate): void {
 		for (const listener of this.listeners) {
 			try {
-				listener(update);
+				listener({
+					run: snapshotRunRecord(update.run),
+					...(update.previousState
+						? { previousState: update.previousState }
+						: {}),
+				});
 			} catch {
 				/* extensions must not break execution */
 			}

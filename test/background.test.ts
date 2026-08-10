@@ -8,6 +8,7 @@ import { getRuntime, SubagentRuntime } from "../src/runtime.ts";
 import {
 	type AgentDefinition,
 	type ResolvedAgentRunRequest,
+	type RunRecord,
 	TERMINAL_STATES,
 } from "../src/types.ts";
 
@@ -57,6 +58,44 @@ test("hot reload adopts the current runtime prototype without losing state", () 
 	} finally {
 		if (previous) globals[symbol] = previous;
 		else delete globals[symbol];
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("runtime returns and emits detached deep run snapshots", () => {
+	const directory = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-subagents-snapshots-"),
+	);
+	try {
+		const runtime = new SubagentRuntime(
+			new RunStore(path.join(directory, "runs")),
+		);
+		let emitted: RunRecord | undefined;
+		const unsubscribe = runtime.subscribe((update) => {
+			emitted = update.run;
+			update.run.usage.cost = 999;
+			if (update.run.metadata) update.run.metadata.input = "mutated";
+		});
+		const created = runtime.createWorkflowRecord(
+			"snapshot-test",
+			{ nested: { value: "original" } },
+			{ cwd: directory, background: false },
+		);
+		created.usage.cost = 888;
+		const returnedInput = created.metadata?.input as {
+			nested: { value: string };
+		};
+		returnedInput.nested.value = "changed";
+		assert.equal(emitted?.usage.cost, 999);
+		const listed = runtime.list()[0];
+		assert.ok(listed);
+		listed.usage.cost = 777;
+		assert.deepEqual(runtime.get(created.id)?.metadata?.input, {
+			nested: { value: "original" },
+		});
+		assert.equal(runtime.get(created.id)?.usage.cost, 0);
+		unsubscribe();
+	} finally {
 		fs.rmSync(directory, { recursive: true, force: true });
 	}
 });
@@ -111,6 +150,45 @@ test("background subagent returns immediately and completes independently", asyn
 			[started.id],
 		);
 		assert.equal(runtime.getForSession(started.id, "session-b"), undefined);
+	} finally {
+		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
+		else process.env.PI_SUBAGENTS_PI_BIN = previous;
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("runtime shutdown waits for active child cancellation", async () => {
+	const directory = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-subagents-shutdown-"),
+	);
+	const script = path.join(directory, "mock-pi.mjs");
+	fs.writeFileSync(script, "#!/usr/bin/env node\nsetInterval(()=>{},1000);\n");
+	fs.chmodSync(script, 0o755);
+	const previous = process.env.PI_SUBAGENTS_PI_BIN;
+	process.env.PI_SUBAGENTS_PI_BIN = script;
+	try {
+		const runtime = new SubagentRuntime(
+			new RunStore(path.join(directory, "runs")),
+		);
+		const agent = definition(script);
+		const started = await runtime.startAgent(
+			{
+				agent: "shutdown-child",
+				task: "wait",
+				definition: agent,
+				difficulty: 3,
+				background: true,
+				context: "fresh",
+				cwd: directory,
+				workspace: "shared",
+				timeoutMs: 10_000,
+				maxTurns: 2,
+				systemPrompt: "mock",
+			},
+			{ background: true },
+		);
+		await runtime.shutdown();
+		assert.equal(runtime.get(started.id)?.state, "cancelled");
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
 		else process.env.PI_SUBAGENTS_PI_BIN = previous;

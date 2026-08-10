@@ -6,6 +6,7 @@ import type {
 	RunRecord,
 	WorkflowSnapshot,
 } from "./types.ts";
+import { TERMINAL_STATES } from "./types.ts";
 
 function privateMkdir(directory: string): void {
 	fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -175,9 +176,9 @@ export class RunStore {
 		const changed: RunRecord[] = [];
 		for (const record of this.list(1000)) {
 			if (
-				!(
-					["queued", "starting", "running", "needs_input"] as string[]
-				).includes(record.state)
+				record.state !== "queued" &&
+				record.state !== "starting" &&
+				record.state !== "running"
 			)
 				continue;
 			const ownerPid =
@@ -212,18 +213,7 @@ export class RunStore {
 		const cutoff = Date.now() - retentionDays * 24 * 60 * 60_000;
 		let removed = 0;
 		for (const record of this.list(10_000)) {
-			if (
-				record.updatedAt >= cutoff ||
-				!(
-					[
-						"succeeded",
-						"failed",
-						"timed_out",
-						"cancelled",
-						"orphaned",
-					] as string[]
-				).includes(record.state)
-			)
+			if (record.updatedAt >= cutoff || !TERMINAL_STATES.has(record.state))
 				continue;
 			try {
 				fs.rmSync(this.runDir(record.id), { recursive: true, force: true });

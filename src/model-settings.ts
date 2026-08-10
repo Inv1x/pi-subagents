@@ -138,11 +138,8 @@ async function chooseProfile(
 	existing?: AgentModelProfile,
 ): Promise<AgentModelProfile | undefined> {
 	await ctx.modelRegistry.refresh();
-	const available = (
-		ctx.scopedModels.length > 0
-			? ctx.scopedModels.map(({ model }) => model)
-			: ctx.modelRegistry.getAvailable()
-	)
+	const available = ctx.modelRegistry
+		.getAvailable()
 		.map((model) => ({ model, id: `${model.provider}/${model.id}` }))
 		.sort((a, b) => a.id.localeCompare(b.id));
 	if (!available.length) {
@@ -154,11 +151,7 @@ async function chooseProfile(
 		label: item.id,
 		description: item.model.name,
 	}));
-	if (
-		existing &&
-		ctx.scopedModels.length === 0 &&
-		!modelOptions.some((item) => item.value === existing.model)
-	) {
+	if (existing && !modelOptions.some((item) => item.value === existing.model)) {
 		modelOptions.unshift({
 			value: existing.model,
 			label: existing.model,

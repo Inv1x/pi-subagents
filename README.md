@@ -7,7 +7,7 @@ Focused subagents and bounded programmatic workflows for [Pi](https://github.com
 - One `subagent_run` tool per isolated child, matching Claude Code's simple delegation model.
 - Natural parallelism: Pi can emit several sibling `subagent_run` calls in one assistant turn.
 - One global scheduler with foreground priority, concurrency limits, and shared-workspace writer leases.
-- Foreground and background runs with streaming activity, usage, cancellation, timeout, and bounded output.
+- Foreground and background runs with quiet transcript rows, live activity, usage, cancellation, timeout, and bounded artifacts.
 - Durable versioned run artifacts under `~/.pi/agent/subagents/runs/`.
 - Programmatic TypeScript workflows with stable steps, dynamic fan-out, joins, and replay.
 - Worktree isolation with patch capture for write-capable children.
@@ -163,9 +163,9 @@ Model and thinking fields resolve independently in this order:
 
 With no configured ladder, behavior remains the same as before. `model: inherit` follows the live parent selection. The extension passes resolved values through Pi's `--model` and `--thinking` flags, then records the difficulty, requested model/effort, and actual provider/model reported by the child in durable run status.
 
-Compact run rows show the selected model and effort for that individual run. The fleet status intentionally omits a single model because concurrent children can use different configurations. Expanded output and `/subagents-fleet` retain the full model and usage details.
+Compact run rows show the selected model and effort for that individual run without rendering child response bodies, including when Pi expands a tool row. Full results remain model-visible in tool/custom-message content and available in `/subagents-fleet` and durable artifacts. The fleet status intentionally omits a single model because concurrent children can use different configurations.
 
-The child transport passes the canonical model through `--model` and the clamped effort through `--thinking`. Explicit models, bare model resolution, profile settings, doctor diagnostics, and persisted workflow routing all honor the parent session's `ctx.scopedModels`; an empty Pi scope means unrestricted. Run metadata records the requested model/effort and the model reported by Pi; a reported selected-model mismatch fails the run instead of silently falling back. Concrete upstream `responseModel` values are retained when providers expose them.
+The child transport passes the canonical model through `--model` and the clamped effort through `--thinking`. Explicit models, bare model resolution, profile settings, doctor diagnostics, and workflow routing resolve against every model in `modelRegistry.getAvailable()`; `ctx.scopedModels` and old persisted workflow `scopedModels` fields are ignored. Run metadata records the requested model/effort and the model reported by Pi; a reported selected-model mismatch fails the run instead of silently falling back. Concrete upstream `responseModel` values are retained when providers expose them.
 
 Children run with `--no-session` because this package owns their durable artifacts. Session-file-only usage trackers therefore see the parent session but not child requests; use the per-run status files or fleet totals for authoritative child usage.
 
@@ -299,17 +299,17 @@ Each run has a private directory:
 
 Model-visible output is capped; full output remains in `output.md`. JSON event lines and stderr are independently bounded.
 
-Pi 0.84 delta-only updates are assembled only for bounded live display; the final `message_end` remains authoritative. A zero-exit child still fails if it does not produce a final assistant result followed by `agent_settled`.
+Pi 0.84 assistant deltas are intentionally ignored so child response bodies never stream into the parent transcript; the final `message_end` remains authoritative and is runtime-validated. A zero-exit child still fails if it does not produce a valid final assistant result followed by `agent_settled`.
 
 After Pi exhausts its own provider-level retries, the extension retries a child process for recognized transient failures such as WebSocket disconnects, connection resets, rate limits, and 5xx responses. Retries use bounded exponential backoff, preserve cumulative usage/cost and attempt history, and stay within the original run timeout. To avoid repeating side effects, the extension does not restart a child after it has invoked `bash`, `edit`, or `write`. Set `maxRetries` to `0` globally or per run to disable process-level retries.
 
-The current session's active fleet is summarized in one compact status line. Workflow children are represented by their workflow rather than counted as standalone agents. Finished standalone runs remain visible for five minutes; workflow families remain visible together until five minutes after their last child activity, so the inspector keeps every agent run by a visible workflow. Open the fleet inspector with `/subagents-fleet`; with `pi-ui-customization` loaded, an empty editor can use `Up`/`Down` to select the footer status and `Enter` to open it. The extension opts this status into preserving its accent color during selection, so terminal inversion uses that color as the selected background. That navigation is owned by the editor only, so selectors and overlays keep normal ownership of their keys. The inspector groups workflow children beneath their parent, uses state-colored markers, and shows run metadata and scrollable output in a separate panel. Use `Up`/`Down` to select runs, `g`/`G` to jump, `j`/`k` to scroll output, `b` to background an eligible run, `r` to refresh, and `Esc`, `Ctrl+C`, or `q` to close. Detailed output remains available through the control tools. Set `showStatus` to `false` to hide the summary; the former `showWidget: false` setting is still honored for compatibility.
+The current session's active fleet is summarized in one compact status line. Workflow children are represented by their workflow rather than counted as standalone agents. Finished standalone runs and complete workflow families remain visible for exactly five minutes from their `endedAt` timestamps; later metadata updates do not extend the window. Open the fleet inspector with `/subagents-fleet`; with `pi-ui-customization` loaded, editor footer navigation can select the status and `Enter` opens it. The extension opts this status into preserving its accent color during selection, so terminal inversion uses that color as the selected background. That navigation is owned by the editor only, so selectors and overlays keep normal ownership of their keys. The inspector groups workflow children beneath their parent, uses state-colored markers, and shows task, final result/error, model/usage, and output/transcript/patch artifact paths in a scrollable details panel. Difficulty is intentionally omitted. Use `Up`/`Down` to select runs, `g`/`G` to jump, `j`/`k` to scroll the selected details without changing selection, `b` to background an eligible run, `r` to refresh, and `Esc`, `Ctrl+C`, or `q` to close. Literal shortcuts support Kitty keyboard sequences. Set `showStatus` to `false` to hide the summary; the former `showWidget: false` setting is still honored for compatibility.
 
 ## Background lifecycle
 
 Background work returns control to the parent immediately and survives parent turns, Pi session switches, and extension reloads inside the same Pi process through a process-global runtime. Runs continue globally, but status, costs, notifications, fleet views, commands, and control tools are projected only into the owning Pi session.
 
-A full Pi process exit stops owned work. On the next startup, unfinished persisted runs are marked `orphaned`; workflows can be explicitly resumed and replay completed stable steps.
+A full Pi process exit aborts and awaits owned agents and workflows, escalating the detached POSIX process group when needed so descendants do not survive the parent. On the next startup, any unfinished persisted runs are marked `orphaned`; workflows can be explicitly resumed and replay completed stable steps.
 
 This release does not yet run a fully detached durable orchestrator daemon.
 

@@ -309,7 +309,7 @@ test("workflow fallback preserves undefined defaults from pinned routing", async
 		assert.equal(route?.model, undefined);
 		assert.equal(route?.thinking, undefined);
 
-		const outsideScope = await engine.start(
+		const ignoredOldScope = await engine.start(
 			workflow,
 			{},
 			{
@@ -324,11 +324,57 @@ test("workflow fallback preserves undefined defaults from pinned routing", async
 				resolveAgent: (name) => (name === "mock" ? agent : undefined),
 			},
 		);
-		assert.equal(outsideScope.state, "failed");
-		assert.match(outsideScope.error?.message ?? "", /outside the pinned/);
+		assert.equal(ignoredOldScope.state, "failed");
+		assert.doesNotMatch(ignoredOldScope.error?.message ?? "", /scopedModels/);
+		const ignoredRoute = runtime.store.readWorkflow(ignoredOldScope.id)?.steps
+			.only?.metadata?.route as { model?: string } | undefined;
+		assert.equal(ignoredRoute?.model, "outside/model");
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
 		else process.env.PI_SUBAGENTS_PI_BIN = previous;
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("workflow shutdown waits for active workflows to settle", async () => {
+	const directory = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-subagents-workflow-shutdown-"),
+	);
+	try {
+		const runtime = new SubagentRuntime(
+			new RunStore(path.join(directory, "runs")),
+		);
+		const engine = new WorkflowEngine(runtime);
+		const workflow: DiscoveredWorkflow = {
+			source: "user",
+			filePath: path.join(directory, "shutdown.workflow.ts"),
+			definitionHash: "shutdown-hash",
+			definition: {
+				name: "shutdown-flow",
+				description: "test",
+				async run(ctx) {
+					await new Promise<void>((_resolve, reject) =>
+						ctx.signal.addEventListener(
+							"abort",
+							() => reject(ctx.signal.reason),
+							{ once: true },
+						),
+					);
+				},
+			},
+		};
+		const started = await engine.start(
+			workflow,
+			{},
+			{
+				cwd: directory,
+				background: true,
+				resolveAgent: () => undefined,
+			},
+		);
+		await engine.shutdown();
+		assert.equal(runtime.get(started.id)?.state, "cancelled");
+	} finally {
 		fs.rmSync(directory, { recursive: true, force: true });
 	}
 });

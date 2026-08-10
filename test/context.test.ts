@@ -22,29 +22,28 @@ function routingContext(options: {
 	} as unknown as ExtensionContext;
 }
 
-test("pinned model routing preserves unrestricted snapshots and validates fallbacks", () => {
+test("model routing uses every available model and ignores scopes", () => {
 	const changedContext = routingContext({
 		current: { provider: "current", id: "outside" },
 		scoped: [{ provider: "current", id: "outside" }],
 	});
 	assert.equal(
-		canonicalModelSpec(changedContext, "old/model", undefined),
+		canonicalModelSpec(changedContext, "old/model", ["different/model"]),
 		"old/model",
-		"an undefined snapshot scope remains unrestricted after the current scope changes",
+		"old persisted workflow scopes are readable but ignored",
 	);
 	assert.equal(
-		canonicalModelSpec(changedContext, "model", ["old/model"]),
+		canonicalModelSpec(changedContext, "model", ["different/model"]),
 		"old/model",
-		"short fallback routes resolve only within the pinned scope",
+		"bare model names resolve against all available models",
 	);
 	assert.equal(
 		canonicalModelSpec(changedContext, undefined, ["old/model"]),
 		undefined,
-		"an undefined saved model stays undefined instead of drifting to the current model",
 	);
-	assert.throws(
-		() => canonicalModelSpec(changedContext, "current/outside", ["old/model"]),
-		/outside the pinned scopedModels selection/,
+	assert.equal(
+		canonicalModelSpec(changedContext, "current/outside", ["old/model"]),
+		"current/outside",
 	);
 });
 

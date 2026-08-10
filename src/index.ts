@@ -254,46 +254,27 @@ function selectedModel(ctx: ExtensionContext): string | undefined {
 	return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 }
 
-function currentModelScope(
-	ctx: ExtensionContext,
-): readonly string[] | undefined {
-	return ctx.scopedModels.length > 0
-		? ctx.scopedModels.map(({ model }) => `${model.provider}/${model.id}`)
-		: undefined;
-}
-
 export function canonicalModelSpec(
 	ctx: ExtensionContext,
 	requested: string | undefined,
-	pinnedScope: readonly string[] | undefined,
+	_persistedScopedModels?: readonly string[],
 ): string | undefined {
 	const candidate = requested;
 	if (candidate === undefined) return undefined;
-	const allowed = pinnedScope ? new Set(pinnedScope) : undefined;
+	const available = ctx.modelRegistry.getAvailable();
 	const separator = candidate.indexOf("/");
 	if (separator > 0) {
 		const provider = candidate.slice(0, separator);
 		const modelId = candidate.slice(separator + 1);
 		if (
-			ctx.modelRegistry.find(provider, modelId) &&
-			(!allowed || allowed.has(candidate))
+			available.some(
+				(model) => model.provider === provider && model.id === modelId,
+			)
 		)
 			return candidate;
-		throw new Error(
-			`Child model '${candidate}' is unknown or outside the pinned scopedModels selection.`,
-		);
+		throw new Error(`Unknown child model '${candidate}'.`);
 	}
-	const candidates = allowed
-		? [...allowed].flatMap((reference) => {
-				const split = reference.indexOf("/");
-				const found = ctx.modelRegistry.find(
-					reference.slice(0, split),
-					reference.slice(split + 1),
-				);
-				return found ? [found] : [];
-			})
-		: ctx.modelRegistry.getAvailable();
-	const matches = candidates.filter((model) => model.id === candidate);
+	const matches = available.filter((model) => model.id === candidate);
 	const currentProviderMatch = matches.find(
 		(model) => model.provider === ctx.model?.provider,
 	);
@@ -369,11 +350,7 @@ function resolveRequest(
 		parentModel: selectedModel(ctx),
 		parentThinking,
 	});
-	const model = canonicalModelSpec(
-		ctx,
-		route.model ?? selectedModel(ctx),
-		currentModelScope(ctx),
-	);
+	const model = canonicalModelSpec(ctx, route.model ?? selectedModel(ctx));
 	const thinking = effectiveThinking(ctx, model, route.thinking, true);
 	const timeoutMs = params.timeoutMs ?? definition.timeoutMs;
 	const maxTurns = params.maxTurns ?? definition.maxTurns;
@@ -416,13 +393,6 @@ function createWorkflowRouting(
 	return {
 		defaultModel: selectedModel(ctx),
 		defaultThinking: parentThinking,
-		...(ctx.scopedModels.length > 0
-			? {
-					scopedModels: ctx.scopedModels.map(
-						({ model }) => `${model.provider}/${model.id}`,
-					),
-				}
-			: {}),
 		agentModels: config.agentModels,
 		agents: Object.fromEntries(agents.map((agent) => [agent.name, agent])),
 	};
@@ -444,7 +414,7 @@ function resolveWorkflowAgentRoute(
 		parentModel: routing.defaultModel,
 		parentThinking: routing.defaultThinking,
 	});
-	const model = canonicalModelSpec(ctx, route.model, routing.scopedModels);
+	const model = canonicalModelSpec(ctx, route.model);
 	return {
 		...route,
 		model,
@@ -455,16 +425,16 @@ function resolveWorkflowAgentRoute(
 function validateWorkflowAgentRoute(
 	route: ReturnType<typeof resolveAgentModelRoute>,
 	ctx: ExtensionContext,
-	routing: WorkflowRoutingSnapshot,
+	_routing: WorkflowRoutingSnapshot,
 ) {
 	const model =
 		route.model === undefined
 			? undefined
-			: canonicalModelSpec(ctx, route.model, routing.scopedModels);
+			: canonicalModelSpec(ctx, route.model);
 	return { ...route, model };
 }
 
-function formatRun(record: RunRecord): string {
+function formatRunStatus(record: RunRecord): string {
 	const name = record.agent ?? record.workflow ?? record.kind;
 	const attempts =
 		typeof record.metadata?.attempt === "number" && record.metadata.attempt > 1
@@ -478,12 +448,16 @@ function formatRun(record: RunRecord): string {
 		record.usage.cost ? `$${record.usage.cost.toFixed(4)}` : undefined,
 	].filter((part): part is string => Boolean(part));
 	const details = selection.length ? ` · ${selection.join(" · ")}` : "";
+	return `${name} ${record.state} [${record.id}]${details}`;
+}
+
+function formatRun(record: RunRecord): string {
 	const output = record.output
 		? `\n\n${record.output}`
 		: record.error
 			? `\n\n${record.error.message}`
 			: "";
-	return `${name} ${record.state} [${record.id}]${details}${output}`;
+	return `${formatRunStatus(record)}${output}`;
 }
 
 function formatWaitResult(record: RunRecord): string {
@@ -506,7 +480,7 @@ export function sendBackgroundCompletion(
 		{
 			customType: BACKGROUND_COMPLETION_MESSAGE,
 			content: formatBackgroundCompletion(record),
-			display: true,
+			display: false,
 			details: { run: record },
 		},
 		{ deliverAs: "followUp", triggerTurn: true },
@@ -618,7 +592,7 @@ export default function (pi: ExtensionAPI) {
 		);
 	});
 
-	pi.on("session_shutdown", (event, ctx) => {
+	pi.on("session_shutdown", async (event, ctx) => {
 		if (uiSessionId) closeFleet(runtime, uiSessionId);
 		uiSessionId = undefined;
 		uninstallUi?.();
@@ -626,7 +600,8 @@ export default function (pi: ExtensionAPI) {
 		uninstallStatusActivation?.();
 		uninstallStatusActivation = undefined;
 		reconcileBackgroundCompletions(ctx, runtime);
-		if (event.reason === "quit") runtime.shutdown();
+		if (event.reason === "quit")
+			await Promise.all([workflowEngine.shutdown(), runtime.shutdown()]);
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
@@ -755,7 +730,7 @@ export default function (pi: ExtensionAPI) {
 			const unsubscribe = runtime.subscribe((update) => {
 				if (update.run.id !== activeRunId) return;
 				onUpdate?.({
-					content: [{ type: "text", text: formatRun(update.run) }],
+					content: [{ type: "text", text: formatRunStatus(update.run) }],
 					details: {
 						run: update.run,
 						recentActivity: runtime.getActivities(update.run.id),
@@ -965,7 +940,7 @@ export default function (pi: ExtensionAPI) {
 			const unsubscribe = runtime.subscribe((update) => {
 				if (update.run.id !== parentId) return;
 				onUpdate?.({
-					content: [{ type: "text", text: formatRun(update.run) }],
+					content: [{ type: "text", text: formatRunStatus(update.run) }],
 					details: { run: update.run } satisfies SubagentToolDetails,
 				});
 			});
@@ -1517,19 +1492,10 @@ export default function (pi: ExtensionAPI) {
 				`Pi executable: ${process.execPath}`,
 			];
 			await ctx.modelRegistry.refresh();
-			const scopedModelReferences = ctx.scopedModels.map(
-				({ model }) => `${model.provider}/${model.id}`,
-			);
-			lines.push(
-				ctx.scopedModels.length > 0
-					? `Scoped models: ${scopedModelReferences.length} (${scopedModelReferences.join(", ")})`
-					: "Scoped models: unrestricted",
-			);
+			const available = ctx.modelRegistry.getAvailable();
+			lines.push(`Available models: ${available.length}`);
 			const availableModels = new Set(
-				(ctx.scopedModels.length > 0
-					? ctx.scopedModels.map(({ model }) => model)
-					: ctx.modelRegistry.getAvailable()
-				).map((model) => `${model.provider}/${model.id}`),
+				available.map((model) => `${model.provider}/${model.id}`),
 			);
 			const unavailableProfiles = Object.entries(config.agentModels).flatMap(
 				([agent, profiles]) =>

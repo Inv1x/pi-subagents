@@ -65,7 +65,7 @@ test("background completion is a model-visible follow-up that triggers a turn", 
 		customType: "pi-subagents-completion",
 		content:
 			"Background subagent background-reviewer succeeded [agent_completion].\n\nReview complete.",
-		display: true,
+		display: false,
 		details: { run },
 	});
 });

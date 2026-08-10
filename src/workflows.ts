@@ -25,6 +25,7 @@ import type {
 	WorkflowSnapshot,
 	WorkflowStepRecord,
 } from "./types.ts";
+import { snapshotRunRecord } from "./types.ts";
 import type {
 	WorkflowAgentResult,
 	WorkflowAgentSpec,
@@ -443,7 +444,7 @@ export class WorkflowEngine {
 			this.runtime.store.writeWorkflow(snapshot);
 		}
 
-		options.onCreated?.({ ...record });
+		options.onCreated?.(snapshotRunRecord(record));
 		const controller = new AbortController();
 		const parentAbort = () =>
 			controller.abort(
@@ -501,6 +502,13 @@ export class WorkflowEngine {
 		if (!active) return record;
 		active.controller.abort(new Error("Workflow stopped by user"));
 		return record;
+	}
+
+	async shutdown(): Promise<void> {
+		const pending = [...this.active.values()];
+		for (const { controller } of pending)
+			controller.abort(new Error("Parent process shutting down"));
+		await Promise.allSettled(pending.map(({ promise }) => promise));
 	}
 
 	private async execute(
@@ -588,15 +596,6 @@ export class WorkflowEngine {
 						? routing.defaultThinking
 						: options.defaultThinking,
 				});
-			if (
-				route.model !== undefined &&
-				routing?.scopedModels !== undefined &&
-				!routing.scopedModels.includes(route.model)
-			) {
-				throw new Error(
-					`Workflow model route '${route.model}' is outside the pinned scopedModels selection.`,
-				);
-			}
 			const model = route.model;
 			const thinking =
 				options.resolveThinking?.(model, route.thinking) ?? route.thinking;
@@ -890,7 +889,12 @@ export class WorkflowEngine {
 				`[pi-subagents] Could not persist failed workflow run ${record.id}:`,
 				persistenceError,
 			);
-			return { ...record, state, error: failure, output: failure.message };
+			return snapshotRunRecord({
+				...record,
+				state,
+				error: failure,
+				output: failure.message,
+			});
 		}
 	}
 

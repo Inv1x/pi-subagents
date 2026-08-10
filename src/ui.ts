@@ -2,14 +2,10 @@ import type {
 	ExtensionContext,
 	KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import {
 	type Component,
-	Container,
-	Markdown,
 	matchesKey,
 	type OverlayHandle,
-	Spacer,
 	Text,
 	type TUI,
 	truncateToWidth,
@@ -121,21 +117,7 @@ function statusLine(
 	return `${icon} ${title}${theme.fg("muted", run.state)} · ${theme.fg("dim", details.join(" · "))}`;
 }
 
-function visibleOutput(output: string): { text: string; structured: boolean } {
-	const trimmed = output.trim();
-	if (!trimmed.startsWith("{") && !trimmed.startsWith("["))
-		return { text: output, structured: false };
-	try {
-		const value = JSON.parse(trimmed) as { output?: unknown } | unknown[];
-		if (!Array.isArray(value) && typeof value.output === "string")
-			return { text: value.output, structured: true };
-		return { text: "", structured: true };
-	} catch {
-		return { text: output, structured: false };
-	}
-}
-
-function collapsedRun(
+function compactRun(
 	run: RunRecord,
 	theme: ExtensionContext["ui"]["theme"],
 	includeTitle: boolean,
@@ -144,70 +126,7 @@ function collapsedRun(
 	if (run.error) lines.push(theme.fg("error", run.error.message));
 	else if (!TERMINAL_STATES.has(run.state) && run.activity?.message)
 		lines.push(theme.fg("dim", run.activity.message));
-	else if (run.output) {
-		const output = visibleOutput(run.output);
-		const outputLines = output.text.split("\n");
-		if (output.text)
-			lines.push(theme.fg("toolOutput", outputLines.slice(0, 3).join("\n")));
-		if (output.structured && !output.text)
-			lines.push(theme.fg("dim", "Structured result"));
-		if (output.structured || outputLines.length > 3)
-			lines.push(theme.fg("muted", "(Ctrl+O for details)"));
-	}
 	return new Text(lines.join("\n"), 0, 0);
-}
-
-function expandedRun(
-	run: RunRecord,
-	recentActivity: string[] | undefined,
-	theme: ExtensionContext["ui"]["theme"],
-): Component {
-	const container = new Container();
-	container.addChild(new Text(statusLine(run, theme, true), 0, 0));
-	container.addChild(new Spacer(1));
-	container.addChild(new Text(theme.fg("muted", "Task"), 0, 0));
-	container.addChild(
-		new Text(
-			theme.fg("dim", run.task ?? JSON.stringify(run.metadata?.input ?? "")),
-			0,
-			0,
-		),
-	);
-	if (recentActivity?.length) {
-		container.addChild(new Spacer(1));
-		container.addChild(new Text(theme.fg("muted", "Recent activity"), 0, 0));
-		container.addChild(
-			new Text(
-				recentActivity.map((line) => theme.fg("dim", `→ ${line}`)).join("\n"),
-				0,
-				0,
-			),
-		);
-	}
-	container.addChild(new Spacer(1));
-	container.addChild(new Text(theme.fg("muted", "Result"), 0, 0));
-	if (run.output)
-		container.addChild(new Markdown(run.output, 0, 0, getMarkdownTheme()));
-	else
-		container.addChild(
-			new Text(theme.fg("dim", run.error?.message ?? "(running)"), 0, 0),
-		);
-	const paths = [
-		run.outputArtifact ? `Output: ${run.outputArtifact}` : undefined,
-		run.transcriptArtifact
-			? `Transcript: ${run.transcriptArtifact}`
-			: undefined,
-		run.patchArtifact ? `Patch: ${run.patchArtifact}` : undefined,
-	].filter((line): line is string => Boolean(line));
-	if (paths.length) {
-		container.addChild(new Spacer(1));
-		container.addChild(
-			new Text(paths.map((line) => theme.fg("dim", line)).join("\n"), 0, 0),
-		);
-	}
-	const usage = usageLine(run);
-	if (usage) container.addChild(new Text(theme.fg("dim", usage), 0, 0));
-	return container;
 }
 
 export function renderRunCall(
@@ -236,45 +155,36 @@ type RunRenderLifecycle = {
 
 class LiveRunComponent implements Component {
 	private run: RunRecord;
-	private recentActivity: string[] | undefined;
-	private expanded: boolean;
 	private theme: ExtensionContext["ui"]["theme"];
 	private resolveRun: ((runId: string) => RunRecord | undefined) | undefined;
 
 	constructor(
 		run: RunRecord,
-		recentActivity: string[] | undefined,
-		expanded: boolean,
+		_recentActivity: string[] | undefined,
+		_expanded: boolean,
 		theme: ExtensionContext["ui"]["theme"],
 		lifecycle: RunRenderLifecycle,
 	) {
 		this.resolveRun = lifecycle.resolveRun;
 		this.run = this.resolveRun?.(run.id) ?? run;
-		this.recentActivity = recentActivity;
-		this.expanded = expanded;
 		this.theme = theme;
 	}
 
 	update(
 		run: RunRecord,
-		recentActivity: string[] | undefined,
-		expanded: boolean,
+		_recentActivity: string[] | undefined,
+		_expanded: boolean,
 		theme: ExtensionContext["ui"]["theme"],
 		lifecycle: RunRenderLifecycle,
 	): void {
 		this.resolveRun = lifecycle.resolveRun;
 		this.run = this.resolveRun?.(run.id) ?? run;
-		this.recentActivity = recentActivity;
-		this.expanded = expanded;
 		this.theme = theme;
 	}
 
 	render(width: number): string[] {
 		this.run = this.resolveRun?.(this.run.id) ?? this.run;
-		const component = this.expanded
-			? expandedRun(this.run, this.recentActivity, this.theme)
-			: collapsedRun(this.run, this.theme, false);
-		return component.render(width);
+		return compactRun(this.run, this.theme, false).render(width);
 	}
 
 	invalidate(): void {}
@@ -291,14 +201,7 @@ export function renderRunResult(
 ): Component {
 	const details = result.details as SubagentToolDetails | undefined;
 	const run = details?.run;
-	if (!run) {
-		return new Text(
-			result.content.find((part) => part.type === "text")?.text ??
-				"(no output)",
-			0,
-			0,
-		);
-	}
+	if (!run) return new Text("Subagent status unavailable.", 0, 0);
 	const component =
 		lifecycle.lastComponent instanceof LiveRunComponent
 			? lifecycle.lastComponent
@@ -337,22 +240,14 @@ export function renderControlResult(
 		content: Array<{ type: string; text?: string }>;
 		details?: unknown;
 	},
-	options: { expanded: boolean; isPartial?: boolean },
+	_options: { expanded: boolean; isPartial?: boolean },
 	theme: ExtensionContext["ui"]["theme"],
 ): Component {
 	const runs = (result.details as ControlToolDetails | undefined)?.runs;
-	if (!runs?.length)
-		return new Text(
-			result.content.find((part) => part.type === "text")?.text ?? "(no runs)",
-			0,
-			0,
-		);
+	if (!runs?.length) return new Text("Run status unavailable.", 0, 0);
 	const firstRun = runs[0];
-	if (runs.length === 1 && firstRun)
-		return options.expanded
-			? expandedRun(firstRun, undefined, theme)
-			: collapsedRun(firstRun, theme, true);
-	const shown = options.expanded ? runs : runs.slice(0, 8);
+	if (runs.length === 1 && firstRun) return compactRun(firstRun, theme, true);
+	const shown = runs.slice(0, 8);
 	const lines = shown.map((run) => statusLine(run, theme, true));
 	if (shown.length < runs.length)
 		lines.push(theme.fg("muted", `… +${runs.length - shown.length} more`));
@@ -406,44 +301,43 @@ export function closeFleet(runtime: SubagentRuntime, sessionId: string): void {
 	getFleetOverlayState(runtime, sessionId)?.close?.();
 }
 
-function workflowFamilyActivity(runs: RunRecord[]): Map<string, number> {
-	const activity = new Map<string, number>();
+function workflowFamilyEndedAt(runs: RunRecord[]): Map<string, number> {
+	const endedAt = new Map<string, number>();
 	for (const run of runs) {
-		if (run.kind === "workflow") activity.set(run.id, run.updatedAt);
+		if (run.kind === "workflow") endedAt.set(run.id, run.endedAt ?? 0);
 	}
 	for (const run of runs) {
-		if (!run.parentRunId || !activity.has(run.parentRunId)) continue;
-		activity.set(
+		if (!run.parentRunId || !endedAt.has(run.parentRunId)) continue;
+		endedAt.set(
 			run.parentRunId,
-			Math.max(activity.get(run.parentRunId) ?? 0, run.updatedAt),
+			Math.max(endedAt.get(run.parentRunId) ?? 0, run.endedAt ?? 0),
 		);
 	}
-	return activity;
+	return endedAt;
 }
 
 function inspectableFleetRuns(
 	runs: RunRecord[],
 	now = Date.now(),
 ): RunRecord[] {
-	const familyActivity = workflowFamilyActivity(runs);
+	const familyEndedAt = workflowFamilyEndedAt(runs);
 	const inspectableWorkflows = new Set(
 		runs
 			.filter(
 				(run) =>
 					run.kind === "workflow" &&
 					(!TERMINAL_STATES.has(run.state) ||
-						(familyActivity.get(run.id) ?? run.updatedAt) >=
-							now - RECENT_RUN_WINDOW_MS),
+						(familyEndedAt.get(run.id) ?? 0) > now - RECENT_RUN_WINDOW_MS),
 			)
 			.map((run) => run.id),
 	);
 	return runs.filter((run) => {
 		if (run.kind === "workflow") return inspectableWorkflows.has(run.id);
-		if (run.parentRunId && familyActivity.has(run.parentRunId))
+		if (run.parentRunId && familyEndedAt.has(run.parentRunId))
 			return inspectableWorkflows.has(run.parentRunId);
 		return (
 			!TERMINAL_STATES.has(run.state) ||
-			run.updatedAt >= now - RECENT_RUN_WINDOW_MS
+			(run.endedAt ?? 0) > now - RECENT_RUN_WINDOW_MS
 		);
 	});
 }
@@ -492,7 +386,7 @@ export function installUiProjection(
 		if (update && update.run.sessionId !== sessionId) return;
 		const now = Date.now();
 		const all = sessionRuns();
-		const familyActivity = workflowFamilyActivity(all);
+		const familyEndedAt = workflowFamilyEndedAt(all);
 		const inspectable = inspectableFleetRuns(all, now);
 		const standaloneAgents = all.filter(
 			(run) => run.kind === "agent" && !run.parentRunId,
@@ -507,13 +401,12 @@ export function installUiProjection(
 		const recentFinishedAgents = standaloneAgents.filter(
 			(run) =>
 				TERMINAL_STATES.has(run.state) &&
-				run.updatedAt >= now - RECENT_RUN_WINDOW_MS,
+				(run.endedAt ?? 0) > now - RECENT_RUN_WINDOW_MS,
 		);
 		const recentFinishedWorkflows = workflows.filter(
 			(run) =>
 				TERMINAL_STATES.has(run.state) &&
-				(familyActivity.get(run.id) ?? run.updatedAt) >=
-					now - RECENT_RUN_WINDOW_MS,
+				(familyEndedAt.get(run.id) ?? 0) > now - RECENT_RUN_WINDOW_MS,
 		);
 		const queuedAgents = activeAgents.filter(
 			(run) => run.state === "queued",
@@ -531,18 +424,17 @@ export function installUiProjection(
 		expiryTimer = undefined;
 		const nextExpiry = [
 			...recentFinishedAgents.map(
-				(run) => run.updatedAt + RECENT_RUN_WINDOW_MS,
+				(run) => (run.endedAt ?? 0) + RECENT_RUN_WINDOW_MS,
 			),
 			...recentFinishedWorkflows.map(
-				(run) =>
-					(familyActivity.get(run.id) ?? run.updatedAt) + RECENT_RUN_WINDOW_MS,
+				(run) => (familyEndedAt.get(run.id) ?? 0) + RECENT_RUN_WINDOW_MS,
 			),
 		].reduce(
 			(earliest, expiresAt) => Math.min(earliest, expiresAt),
 			Number.POSITIVE_INFINITY,
 		);
 		if (Number.isFinite(nextExpiry)) {
-			expiryTimer = setTimeout(refresh, Math.max(1, nextExpiry - now + 1));
+			expiryTimer = setTimeout(refresh, Math.max(1, nextExpiry - now));
 			expiryTimer.unref?.();
 		}
 		ctx.ui.setWidget("pi-subagents", undefined);
@@ -784,12 +676,34 @@ class FleetComponent implements Component {
 		if (
 			this.keybindings.matches(data, "tui.select.cancel") ||
 			this.keybindings.matches(data, "app.interrupt") ||
-			data === "q"
+			matchesKey(data, "q")
 		) {
 			this.done();
 			return;
 		}
-		if (this.keybindings.matches(data, "tui.select.up")) {
+		// Keep j/k dedicated to details scrolling even when a user keybinding also
+		// maps them to selector navigation.
+		if (matchesKey(data, "k"))
+			this.outputScroll = Math.max(0, this.outputScroll - 1);
+		else if (matchesKey(data, "j")) this.outputScroll += 1;
+		else if (matchesKey(data, "g")) {
+			this.selected = 0;
+			this.outputScroll = 0;
+		} else if (matchesKey(data, "shift+g")) {
+			this.selected = Math.max(0, this.runs.length - 1);
+			this.outputScroll = 0;
+		} else if (matchesKey(data, "b")) {
+			const run = this.runs[this.selected];
+			if (run) {
+				try {
+					this.runtime.background(run.id, this.sessionId);
+				} catch {
+					/* selected run cannot be backgrounded */
+				}
+			}
+			this.refresh();
+		} else if (matchesKey(data, "r")) this.refresh();
+		else if (this.keybindings.matches(data, "tui.select.up")) {
 			const previous = this.selected;
 			this.selected = Math.max(0, this.selected - 1);
 			if (this.selected !== previous) this.outputScroll = 0;
@@ -800,26 +714,7 @@ class FleetComponent implements Component {
 				this.selected + 1,
 			);
 			if (this.selected !== previous) this.outputScroll = 0;
-		} else if (data === "g") {
-			this.selected = 0;
-			this.outputScroll = 0;
-		} else if (data === "G") {
-			this.selected = Math.max(0, this.runs.length - 1);
-			this.outputScroll = 0;
-		} else if (data === "k")
-			this.outputScroll = Math.max(0, this.outputScroll - 1);
-		else if (data === "j") this.outputScroll += 1;
-		else if (data === "b") {
-			const run = this.runs[this.selected];
-			if (run) {
-				try {
-					this.runtime.background(run.id, this.sessionId);
-				} catch {
-					/* selected run cannot be backgrounded */
-				}
-			}
-			this.refresh();
-		} else if (data === "r") this.refresh();
+		}
 		this.tui.requestRender();
 	}
 
@@ -882,6 +777,11 @@ class FleetComponent implements Component {
 			: undefined;
 		const detail = (label: string, value: string) =>
 			`${this.theme.fg("dim", label.padEnd(10))}${value}`;
+		const task =
+			run?.task ??
+			(run?.metadata?.input === undefined
+				? undefined
+				: JSON.stringify(run.metadata.input, null, 2));
 		const rawDetails = run
 			? [
 					detail("Run", this.theme.fg("text", run.id)),
@@ -895,19 +795,26 @@ class FleetComponent implements Component {
 					...(childSummary ? [detail("Progress", childSummary)] : []),
 					detail("Model", modelLabel(run.model) ?? "inherit"),
 					detail("Effort", run.thinking ? `${run.thinking} effort` : "inherit"),
-					...(run.difficulty
-						? [detail("Difficulty", String(run.difficulty))]
-						: []),
 					detail("Usage", usageLine(run) || "-"),
 					detail("Activity", run.activity?.message ?? "-"),
 					detail("Cwd", run.cwd),
 					...(run.outputArtifact ? [detail("Output", run.outputArtifact)] : []),
+					...(run.transcriptArtifact
+						? [detail("Transcript", run.transcriptArtifact)]
+						: []),
 					...(run.patchArtifact ? [detail("Patch", run.patchArtifact)] : []),
 					"",
-					this.theme.fg("muted", "Result"),
-					...(run.output ?? run.error?.message ?? "(no output)")
+					this.theme.fg("muted", "Task"),
+					...(task ?? "(task unavailable)")
 						.split("\n")
-						.map((line) => this.theme.fg("toolOutput", line)),
+						.map((line) => this.theme.fg("dim", line)),
+					"",
+					this.theme.fg("muted", run.error ? "Error" : "Result"),
+					...(run.error?.message ?? run.output ?? "(no output)")
+						.split("\n")
+						.map((line) =>
+							this.theme.fg(run.error ? "error" : "toolOutput", line),
+						),
 				]
 			: [this.theme.fg("dim", "No recorded runs.")];
 		const wrapped = rawDetails.flatMap((line) =>
