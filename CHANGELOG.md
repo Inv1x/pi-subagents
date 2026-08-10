@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Made every field in strict-sampled tool objects required, using nullable values for optional semantics, so Codex/OpenAI accepts the schemas.
 - Parse Pi 0.84 delta-only JSON updates with bounded live assembly while treating `message_end` as authoritative.
 - Fail zero-exit children that lack a final assistant result or `agent_settled` lifecycle watermark.
 - Prefer strict constrained sampling only for closed, compatible management/delegation tool schemas.

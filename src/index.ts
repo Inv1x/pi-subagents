@@ -5,7 +5,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { type Static, Type } from "typebox";
 import {
 	buildChildSystemPrompt,
 	discoverAgents,
@@ -67,65 +67,59 @@ const SubagentRunParams = Type.Object(
 				"Descriptive name for this child run, such as task-auditor or api-scout. May also be an exact discovered agent name.",
 			pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$",
 		}),
-		baseAgent: Type.Optional(
-			Type.String({
-				description:
-					"Exact discovered agent definition whose prompt and tools this named child should use. Omit to use an exact agent-name match, then the general role as fallback.",
-			}),
-		),
+		baseAgent: Type.Union([Type.String(), Type.Null()], {
+			description:
+				"Exact discovered agent definition whose prompt and tools this named child should use, or null to use an exact agent-name match and then the general role as fallback.",
+		}),
 		task: Type.String({ description: "Focused task delegated to the child" }),
-		background: Type.Optional(
-			Type.Boolean({
-				description: "Return immediately and continue in the background",
-			}),
-		),
-		context: Type.Optional(ContextSchema),
-		model: Type.Optional(
-			Type.String({
-				minLength: 1,
+		background: Type.Union([Type.Boolean(), Type.Null()], {
+			description:
+				"True to return immediately and continue in the background; otherwise false or null",
+		}),
+		context: Type.Union([ContextSchema, Type.Null()], {
+			description: "Context mode, or null to use the agent default",
+		}),
+		model: Type.Union([Type.String({ minLength: 1 }), Type.Null()], {
+			description:
+				"Exact provider/model override, or null to use difficulty-based agent profiles and then agent/parent defaults; never invent a model name.",
+		}),
+		thinking: Type.Union([ThinkingSchema, Type.Null()], {
+			description:
+				"Thinking-level override, or null to use configured defaults",
+		}),
+		difficulty: Type.Union(
+			[Type.Integer({ minimum: 1, maximum: 5 }), Type.Null()],
+			{
 				description:
-					"Exact provider/model override. Omit to use difficulty-based agent profiles, then agent/parent defaults; never invent a model name.",
-			}),
+					"Head-agent estimate of task difficulty: 1 trivial, 2 light, 3 standard, 4 complex, 5 critical. Null defaults to 3 and selects a configured model profile.",
+			},
 		),
-		thinking: Type.Optional(ThinkingSchema),
-		difficulty: Type.Optional(
-			Type.Integer({
-				minimum: 1,
-				maximum: 5,
+		cwd: Type.Union([Type.String(), Type.Null()], {
+			description:
+				"Child working directory, relative to the current cwd or absolute; null uses the current cwd",
+		}),
+		workspace: Type.Union([WorkspaceSchema, Type.Null()], {
+			description: "Workspace mode, or null to use the agent default",
+		}),
+		timeoutMs: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()], {
+			description:
+				"Hard wall-clock ceiling in milliseconds, or null to inherit the agent/config default; avoid short ad hoc timeouts for repository-scale tasks.",
+		}),
+		maxTurns: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()], {
+			description:
+				"Hard assistant-turn ceiling, or null to inherit the agent/config default; do not guess a low cap for broad or long-running work.",
+		}),
+		maxRetries: Type.Union(
+			[Type.Integer({ minimum: 0, maximum: 5 }), Type.Null()],
+			{
 				description:
-					"Head-agent estimate of task difficulty: 1 trivial, 2 light, 3 standard, 4 complex, 5 critical. Defaults to 3 and selects a configured model profile.",
-			}),
+					"Whole-child retries after Pi exhausts its own transient-error retries, or null to use extension configuration.",
+			},
 		),
-		cwd: Type.Optional(
-			Type.String({
-				description:
-					"Child working directory, relative to the current cwd or absolute",
-			}),
-		),
-		workspace: Type.Optional(WorkspaceSchema),
-		timeoutMs: Type.Optional(
-			Type.Integer({
-				minimum: 1,
-				description:
-					"Optional hard wall-clock ceiling in milliseconds. Omit to inherit the agent/config default; avoid short ad hoc timeouts for repository-scale tasks.",
-			}),
-		),
-		maxTurns: Type.Optional(
-			Type.Integer({
-				minimum: 1,
-				description:
-					"Optional hard assistant-turn ceiling. Omit to inherit the agent/config default; do not guess a low cap for broad or long-running work.",
-			}),
-		),
-		maxRetries: Type.Optional(
-			Type.Integer({
-				minimum: 0,
-				maximum: 5,
-				description:
-					"Whole-child retries after Pi exhausts its own transient-error retries. Defaults to extension configuration.",
-			}),
-		),
-		agentScope: Type.Optional(AgentScopeSchema),
+		agentScope: Type.Union([AgentScopeSchema, Type.Null()], {
+			description:
+				"Agent discovery scope, or null to use both for trusted projects and user otherwise",
+		}),
 	},
 	{ additionalProperties: false },
 );
@@ -140,22 +134,18 @@ const ControlParams = Type.Object(
 			"interrupt",
 			"stop",
 		] as const),
-		runId: Type.Optional(
-			Type.String({ description: "Full run id or unambiguous prefix" }),
-		),
-		message: Type.Optional(
-			Type.String({
-				description:
-					"Message for send (stateful transport is not yet available)",
-			}),
-		),
-		timeoutMs: Type.Optional(
-			Type.Integer({
-				minimum: 1,
-				description:
-					"How long to observe this wait before returning the current state; the run continues after the window ends",
-			}),
-		),
+		runId: Type.Union([Type.String(), Type.Null()], {
+			description:
+				"Full run id or unambiguous prefix; null is allowed only for list",
+		}),
+		message: Type.Union([Type.String(), Type.Null()], {
+			description:
+				"Message for send (stateful transport is not yet available), otherwise null",
+		}),
+		timeoutMs: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()], {
+			description:
+				"How long to observe a wait before returning the current state, or null for the configured default; the run continues after the window ends",
+		}),
 	},
 	{ additionalProperties: false },
 );
@@ -184,17 +174,25 @@ const WorkflowRunParams = Type.Object(
 const WorkflowControlParams = Type.Object(
 	{
 		action: StringEnum(["list", "status", "wait", "stop", "resume"] as const),
-		runId: Type.Optional(Type.String()),
-		timeoutMs: Type.Optional(
-			Type.Integer({
-				minimum: 1,
-				description:
-					"How long to observe this wait before returning the current state; the workflow continues after the window ends",
-			}),
-		),
+		runId: Type.Union([Type.String(), Type.Null()], {
+			description:
+				"Full workflow run id or unambiguous prefix; null is allowed only for list",
+		}),
+		timeoutMs: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()], {
+			description:
+				"How long to observe a wait before returning the current state, or null for the configured default; the workflow continues after the window ends",
+		}),
 	},
 	{ additionalProperties: false },
 );
+
+function prepareNullableFields<T>(args: unknown, fields: readonly string[]): T {
+	if (!args || typeof args !== "object" || Array.isArray(args))
+		return args as T;
+	const prepared: Record<string, unknown> = { ...args };
+	for (const field of fields) prepared[field] ??= null;
+	return prepared as T;
+}
 
 function textFromMessage(message: unknown): string {
 	if (!message || typeof message !== "object") return "";
@@ -654,14 +652,14 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_run",
 		label: "Subagent",
 		description:
-			"Run one focused, descriptively named child Pi agent with an isolated context. Set baseAgent to a discovered definition such as scout, planner, reviewer, or worker when specialization helps; otherwise the general role is used. To parallelize independent work, emit multiple subagent_run calls together in the same assistant message; Pi executes sibling tool calls concurrently while the extension enforces a global limit. Prefer 2-4 read-only children. Omit maxTurns and timeoutMs unless the user intentionally requests hard ceilings; built-in defaults are designed for long-running work. Do not delegate trivial work or run concurrent shared-workspace writers. Use a programmatic workflow for large dynamic fan-out.",
+			"Run one focused, descriptively named child Pi agent with an isolated context. Set baseAgent to a discovered definition such as scout, planner, reviewer, or worker when specialization helps; otherwise the general role is used. To parallelize independent work, emit multiple subagent_run calls together in the same assistant message; Pi executes sibling tool calls concurrently while the extension enforces a global limit. Prefer 2-4 read-only children. Set maxTurns and timeoutMs to null unless the user intentionally requests hard ceilings; built-in defaults are designed for long-running work. Do not delegate trivial work or run concurrent shared-workspace writers. Use a programmatic workflow for large dynamic fan-out.",
 		promptSnippet:
 			"Run one isolated specialist child in the foreground or background; multiple sibling calls run concurrently",
 		promptGuidelines: [
-			"Give subagent_run agent a concise task-specific name. Set baseAgent to an exact discovered role when its specialization helps; omit baseAgent to use an exact agent-name match or the general fallback.",
+			"Give subagent_run agent a concise task-specific name. Set baseAgent to an exact discovered role when its specialization helps; otherwise set baseAgent to null to use an exact agent-name match or the general fallback.",
 			"Set subagent_run difficulty from 1 (trivial) to 5 (critical) for every child. Use 3 for ordinary work; do not inflate routine tasks.",
-			"Omit subagent_run model and thinking by default so configured difficulty profiles can route the child, then agent/parent defaults can apply; never invent a model override.",
-			"Omit subagent_run maxTurns and timeoutMs unless the user explicitly requests a hard cap. Built-in agents already allow 128 turns and one hour; low ad hoc caps can terminate broad investigations before they produce a handoff.",
+			"Set subagent_run model and thinking to null by default so configured difficulty profiles can route the child, then agent/parent defaults can apply; never invent a model override.",
+			"Set subagent_run maxTurns and timeoutMs to null unless the user explicitly requests a hard cap. Built-in agents already allow 128 turns and one hour; low ad hoc caps can terminate broad investigations before they produce a handoff.",
 			"Proactively consider subagent_run when context isolation, independent review, specialization, or real parallelism would improve the result enough to justify child startup cost.",
 			"For independent parallel tasks, issue multiple subagent_run calls in the same assistant message; do not call them sequentially.",
 			"Set subagent_run background=true when its result is not needed on the immediate critical path. The launch returns immediately: continue useful independent parent work, or end the turn and rely on the completion notification; use subagent_control status/wait later only when the result is needed, and do not poll.",
@@ -670,6 +668,21 @@ export default function (pi: ExtensionAPI) {
 			"Never run concurrent write-capable subagent_run calls in a shared workspace; select worktree isolation or serialize them.",
 		],
 		parameters: SubagentRunParams,
+		prepareArguments: (args) =>
+			prepareNullableFields<Static<typeof SubagentRunParams>>(args, [
+				"baseAgent",
+				"background",
+				"context",
+				"model",
+				"thinking",
+				"difficulty",
+				"cwd",
+				"workspace",
+				"timeoutMs",
+				"maxTurns",
+				"maxRetries",
+				"agentScope",
+			]),
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const config = loadConfig(ctx.cwd, ctx.isProjectTrusted());
@@ -718,7 +731,21 @@ export default function (pi: ExtensionAPI) {
 				if (!approved) throw new Error("Project-local agent was not approved.");
 			}
 			const request = resolveRequest(
-				params,
+				{
+					agent: params.agent,
+					baseAgent: params.baseAgent ?? undefined,
+					task: params.task,
+					background: params.background ?? undefined,
+					context: params.context ?? undefined,
+					model: params.model ?? undefined,
+					thinking: params.thinking ?? undefined,
+					difficulty: params.difficulty ?? undefined,
+					cwd: params.cwd ?? undefined,
+					workspace: params.workspace ?? undefined,
+					timeoutMs: params.timeoutMs ?? undefined,
+					maxTurns: params.maxTurns ?? undefined,
+					maxRetries: params.maxRetries ?? undefined,
+				},
 				definition,
 				ctx,
 				pi.getThinkingLevel(),
@@ -787,6 +814,12 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"List, inspect, wait for, interrupt, or stop subagent runs. Status is a one-shot inspection, not a polling loop. Stateful send is reserved for a future persistent transport.",
 		parameters: ControlParams,
+		prepareArguments: (args) =>
+			prepareNullableFields<Static<typeof ControlParams>>(args, [
+				"runId",
+				"message",
+				"timeoutMs",
+			]),
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const sessionId = ctx.sessionManager.getSessionId();
@@ -815,7 +848,7 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(
 					"subagent_control send requires the planned persistent RPC/SDK transport and is not available yet. Start a new child with selected context instead.",
 				);
-			const id = requireRunId(params.runId, params.action);
+			const id = requireRunId(params.runId ?? undefined, params.action);
 			if (params.action === "status") {
 				const run = runtime.getForSession(id, sessionId);
 				if (run?.kind !== "agent") throw new Error(`Run not found: ${id}`);
@@ -829,7 +862,11 @@ export default function (pi: ExtensionAPI) {
 				if (pending?.kind !== "agent") throw new Error(`Run not found: ${id}`);
 				const releaseObservation = observeRun(pending.id);
 				try {
-					const run = await runtime.wait(pending.id, params.timeoutMs, signal);
+					const run = await runtime.wait(
+						pending.id,
+						params.timeoutMs ?? undefined,
+						signal,
+					);
 					return {
 						content: [{ type: "text", text: formatWaitResult(run) }],
 						details: { runs: [run] },
@@ -1008,6 +1045,11 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"List, inspect, wait for, stop, or resume programmatic workflow runs.",
 		parameters: WorkflowControlParams,
+		prepareArguments: (args) =>
+			prepareNullableFields<Static<typeof WorkflowControlParams>>(args, [
+				"runId",
+				"timeoutMs",
+			]),
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const sessionId = ctx.sessionManager.getSessionId();
@@ -1032,7 +1074,7 @@ export default function (pi: ExtensionAPI) {
 					details: { runs },
 				};
 			}
-			const id = requireRunId(params.runId, params.action);
+			const id = requireRunId(params.runId ?? undefined, params.action);
 			if (params.action === "status") {
 				const run = runtime.getForSession(id, sessionId);
 				if (run?.kind !== "workflow")
@@ -1059,7 +1101,7 @@ export default function (pi: ExtensionAPI) {
 				try {
 					const run = await workflowEngine.wait(
 						pending.id,
-						params.timeoutMs,
+						params.timeoutMs ?? undefined,
 						signal,
 					);
 					return {

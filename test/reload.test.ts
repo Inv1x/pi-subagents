@@ -24,6 +24,44 @@ const expectedTools = [
 	"workflow_control",
 ];
 
+function assertOpenAiStrictSchema(
+	schema: unknown,
+	location = "parameters",
+): void {
+	if (!schema || typeof schema !== "object") return;
+	const node = schema as {
+		type?: string;
+		required?: string[];
+		properties?: Record<string, unknown>;
+		additionalProperties?: boolean;
+		items?: unknown;
+		anyOf?: unknown[];
+	};
+	for (const [index, branch] of (node.anyOf ?? []).entries()) {
+		assertOpenAiStrictSchema(branch, `${location}.anyOf[${index}]`);
+	}
+	if (node.type === "array") {
+		assertOpenAiStrictSchema(node.items, `${location}.items`);
+	}
+	if (node.type !== "object") return;
+	const propertyNames = Object.keys(node.properties ?? {}).sort();
+	assert.equal(
+		node.additionalProperties,
+		false,
+		`${location} must reject undeclared properties`,
+	);
+	if (propertyNames.length > 0) {
+		assert.deepEqual(
+			[...(node.required ?? [])].sort(),
+			propertyNames,
+			`${location}.required must include every property for OpenAI strict mode`,
+		);
+	}
+	for (const [name, property] of Object.entries(node.properties ?? {})) {
+		assertOpenAiStrictSchema(property, `${location}.properties.${name}`);
+	}
+}
+
 function assertToolsRemainExposed(session: {
 	getAllTools(): Array<{
 		name: string;
@@ -58,10 +96,34 @@ test("closed compatible tools prefer provider-supported strict sampling", () => 
 		registerCommand: () => {},
 	} as unknown as ExtensionAPI);
 	for (const name of ["subagent_run", "subagent_control", "workflow_control"]) {
-		assert.deepEqual(
-			tools.find((tool) => tool.name === name)?.constrainedSampling,
-			{ type: "json_schema", strict: "prefer" },
-		);
+		const tool = tools.find((tool) => tool.name === name);
+		assert.deepEqual(tool?.constrainedSampling, {
+			type: "json_schema",
+			strict: "prefer",
+		});
+		assertOpenAiStrictSchema(tool?.parameters, name);
+	}
+	const preparedRun = tools
+		.find((tool) => tool.name === "subagent_run")
+		?.prepareArguments?.({ agent: "review", task: "Review the change" }) as
+		| Record<string, unknown>
+		| undefined;
+	assert.ok(preparedRun);
+	for (const field of [
+		"baseAgent",
+		"background",
+		"context",
+		"model",
+		"thinking",
+		"difficulty",
+		"cwd",
+		"workspace",
+		"timeoutMs",
+		"maxTurns",
+		"maxRetries",
+		"agentScope",
+	]) {
+		assert.equal(preparedRun[field], null, `${field} should default to null`);
 	}
 	assert.equal(
 		tools.find((tool) => tool.name === "workflow_run")?.constrainedSampling,
