@@ -325,11 +325,15 @@ Node.js 22.19 or newer is required.
 
 ```bash
 npm install
+npm run check
 npm run typecheck
 npm test
+npm pack --dry-run
 pi -e . --list-models
 ```
 
 Tests cover protocol framing and limits, scheduler concurrency/resource leases, trust-aware discovery, child JSON event parsing, compact UI rendering, status projection, and workflow fan-out/persistence.
 
-See [`PLAN.md`](PLAN.md) for the product research, architecture decisions, UI rationale, and later milestones.
+## Versioning
+
+Run `npm run changeset` for each user-facing change and commit the generated `.changeset/*.md` file. To prepare a release, run `npm run release:status` and then `npm run release:version`; Changesets consumes the pending files and updates `package.json`, `package-lock.json`, and `CHANGELOG.md`. These commands do not publish to npm or create a GitHub Release.

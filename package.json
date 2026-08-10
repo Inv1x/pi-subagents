@@ -30,7 +30,6 @@
 		"agents",
 		"workflows",
 		"README.md",
-		"PLAN.md",
 		"CHANGELOG.md",
 		"LICENSE"
 	],
@@ -58,10 +57,14 @@
 		"check:fix": "biome check --write .",
 		"typecheck": "tsc --noEmit",
 		"test": "node --import jiti/register --test test/*.test.ts",
+		"changeset": "changeset",
+		"release:status": "changeset status",
+		"release:version": "changeset version && npm install --package-lock-only --ignore-scripts --no-audit --no-fund",
 		"prepack": "npm run check && npm run typecheck && npm test"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.5.5",
+		"@changesets/cli": "2.31.1",
 		"@earendil-works/pi-agent-core": "0.84.1",
 		"@earendil-works/pi-ai": "0.84.1",
 		"@earendil-works/pi-coding-agent": "0.84.1",
