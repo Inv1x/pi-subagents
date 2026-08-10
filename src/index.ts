@@ -779,6 +779,7 @@ export default function (pi: ExtensionAPI) {
 			return renderRunResult(result, options, theme, {
 				lastComponent: context.lastComponent,
 				resolveRun: (runId) => runtime.get(runId),
+				isError: context.isError,
 			});
 		},
 	});
@@ -868,8 +869,10 @@ export default function (pi: ExtensionAPI) {
 		renderCall(args, theme) {
 			return renderControlCall("subagent", args, theme);
 		},
-		renderResult(result, options, theme) {
-			return renderControlResult(result, options, theme);
+		renderResult(result, options, theme, context) {
+			return renderControlResult(result, options, theme, {
+				isError: context.isError,
+			});
 		},
 	});
 
@@ -1010,6 +1013,7 @@ export default function (pi: ExtensionAPI) {
 			return renderRunResult(result, options, theme, {
 				lastComponent: context.lastComponent,
 				resolveRun: (runId) => runtime.get(runId),
+				isError: context.isError,
 			});
 		},
 	});
@@ -1202,8 +1206,10 @@ export default function (pi: ExtensionAPI) {
 		renderCall(args, theme) {
 			return renderControlCall("workflow", args, theme);
 		},
-		renderResult(result, options, theme) {
-			return renderControlResult(result, options, theme);
+		renderResult(result, options, theme, context) {
+			return renderControlResult(result, options, theme, {
+				isError: context.isError,
+			});
 		},
 	});
 

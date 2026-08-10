@@ -125,6 +125,72 @@ test("launch and control renderers stay compact", () => {
 	assert.doesNotMatch(expanded, /# Plan|focused work|runId|Ctrl\+O/);
 });
 
+test("quiet renderers show safe actionable errors and empty lists without child bodies", () => {
+	for (const message of [
+		"Unknown child model 'missing/model'. Use an exact available provider/model identifier.",
+		"Unknown base agent 'missing-agent'. Available: scout, reviewer.",
+	]) {
+		const rendered = renderRunResult(
+			{
+				content: [
+					{ type: "text", text: `${message}\nSECRET CHILD RESPONSE BODY` },
+				],
+			},
+			{ expanded: false },
+			theme,
+			{ isError: true },
+		)
+			.render(300)
+			.join("\n")
+			.trimEnd();
+		assert.equal(rendered, message);
+	}
+
+	const unknownRun = renderControlResult(
+		{
+			content: [
+				{
+					type: "text",
+					text: `Run not found: agent_missing\u001b]8;;https://example.test\u0007${"x".repeat(400)}`,
+				},
+			],
+		},
+		{ expanded: false },
+		theme,
+		{ isError: true },
+	)
+		.render(300)
+		.join("\n")
+		.trimEnd();
+	assert.match(unknownRun, /^Run not found: agent_missing/);
+	assert.doesNotMatch(unknownRun, /example\.test/);
+	assert.ok(unknownRun.length <= 250);
+
+	const empty = renderControlResult(
+		{
+			content: [{ type: "text", text: "No subagent runs." }],
+			details: { runs: [] },
+		},
+		{ expanded: false },
+		theme,
+	)
+		.render(120)
+		.join("\n")
+		.trimEnd();
+	assert.equal(empty, "No subagent runs.");
+
+	const hidden = renderRunResult(
+		{
+			content: [{ type: "text", text: "SECRET CHILD RESPONSE BODY" }],
+		},
+		{ expanded: true },
+		theme,
+	)
+		.render(120)
+		.map((line) => line.trimEnd());
+	assert.deepEqual(hidden, ["Subagent status unavailable."]);
+});
+
 test("running tool rows update elapsed time on natural renders without forced ticks", (context) => {
 	context.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1000 });
 	const active = run({

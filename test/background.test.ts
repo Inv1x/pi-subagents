@@ -162,7 +162,11 @@ test("runtime shutdown waits for active child cancellation", async () => {
 		path.join(os.tmpdir(), "pi-subagents-shutdown-"),
 	);
 	const script = path.join(directory, "mock-pi.mjs");
-	fs.writeFileSync(script, "#!/usr/bin/env node\nsetInterval(()=>{},1000);\n");
+	const pidFile = path.join(directory, "descendant.pid");
+	fs.writeFileSync(
+		script,
+		`#!/usr/bin/env node\nimport fs from 'node:fs';import {spawn} from 'node:child_process';const child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid));setInterval(()=>{},1000);\n`,
+	);
 	fs.chmodSync(script, 0o755);
 	const previous = process.env.PI_SUBAGENTS_PI_BIN;
 	process.env.PI_SUBAGENTS_PI_BIN = script;
@@ -187,8 +191,16 @@ test("runtime shutdown waits for active child cancellation", async () => {
 			},
 			{ background: true },
 		);
+		for (let attempt = 0; attempt < 100 && !fs.existsSync(pidFile); attempt++)
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.equal(fs.existsSync(pidFile), true);
+		const descendantPid = Number(fs.readFileSync(pidFile, "utf8"));
 		await runtime.shutdown();
 		assert.equal(runtime.get(started.id)?.state, "cancelled");
+		assert.throws(
+			() => process.kill(descendantPid, 0),
+			"shutdown must not resolve while a descendant remains",
+		);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
 		else process.env.PI_SUBAGENTS_PI_BIN = previous;

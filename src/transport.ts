@@ -166,6 +166,60 @@ function piInvocation(args: string[]): { command: string; args: string[] } {
 	return { command: process.platform === "win32" ? "pi.cmd" : "pi", args };
 }
 
+function processGroupAlive(pid: number): boolean {
+	try {
+		process.kill(-pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	}
+}
+
+function waitForGraceOrLeaderClose(
+	processHandle: ChildProcess,
+	pid: number,
+	timeoutMs: number,
+): Promise<void> {
+	if (
+		!processGroupAlive(pid) ||
+		processHandle.exitCode !== null ||
+		processHandle.signalCode !== null
+	)
+		return Promise.resolve();
+	return new Promise((resolve) => {
+		let settled = false;
+		const finish = () => {
+			if (settled) return;
+			settled = true;
+			clearInterval(poll);
+			clearTimeout(timeout);
+			processHandle.removeListener("close", finish);
+			resolve();
+		};
+		const poll = setInterval(() => {
+			if (!processGroupAlive(pid)) finish();
+		}, 20);
+		const timeout = setTimeout(finish, timeoutMs);
+		processHandle.once("close", finish);
+	});
+}
+
+function waitForProcessGroupGone(
+	pid: number,
+	timeoutMs: number,
+): Promise<boolean> {
+	if (!processGroupAlive(pid)) return Promise.resolve(true);
+	return new Promise((resolve) => {
+		const startedAt = Date.now();
+		const poll = () => {
+			if (!processGroupAlive(pid)) return resolve(true);
+			if (Date.now() - startedAt >= timeoutMs) return resolve(false);
+			setTimeout(poll, 20);
+		};
+		setTimeout(poll, 20);
+	});
+}
+
 async function terminateProcessTree(
 	processHandle: ChildProcess,
 	graceMs = 3000,
@@ -198,33 +252,24 @@ async function terminateProcessTree(
 			/* already exited */
 		}
 	}
-	await new Promise((resolve) => setTimeout(resolve, graceMs));
-	// Check the process group, not only its leader: the leader may have exited
-	// while a grandchild inherited the detached group.
-	let groupAlive = false;
-	try {
-		process.kill(-pid, 0);
-		groupAlive = true;
-	} catch {
-		/* process group exited */
-	}
-	if (groupAlive) signalGroup("SIGKILL");
-	else {
+	// Cooperative children should not pay the full grace period. A leader close
+	// also ends the grace early so inherited descendants can be escalated.
+	await waitForGraceOrLeaderClose(processHandle, pid, graceMs);
+	if (processGroupAlive(pid)) signalGroup("SIGKILL");
+	else if (
+		processHandle.exitCode === null &&
+		processHandle.signalCode === null
+	) {
 		try {
 			processHandle.kill("SIGKILL");
 		} catch {
 			/* already exited */
 		}
 	}
-	if (processHandle.exitCode === null && processHandle.signalCode === null)
-		await new Promise<void>((resolve) => {
-			const timer = setTimeout(resolve, 1000);
-			timer.unref?.();
-			processHandle.once("close", () => {
-				clearTimeout(timer);
-				resolve();
-			});
-		});
+	// Do not use leader closure as the final watermark: detached descendants can
+	// remain in the same process group after their parent has exited.
+	if (!(await waitForProcessGroupGone(pid, 3000)))
+		throw new Error(`Process group ${pid} remained after SIGKILL.`);
 }
 
 function toolActivity(event: Record<string, unknown>): {

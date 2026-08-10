@@ -151,7 +151,51 @@ export function renderRunCall(
 type RunRenderLifecycle = {
 	lastComponent?: Component;
 	resolveRun?: (runId: string) => RunRecord | undefined;
+	isError?: boolean;
 };
+
+const FALLBACK_RESULT_WIDTH = 240;
+
+function safeResultText(
+	result: { content: Array<{ type: string; text?: string }> },
+	isError: boolean,
+): string | undefined {
+	const raw = result.content
+		.find((part) => part.type === "text" && typeof part.text === "string")
+		?.text?.split(/[\r\n]/, 1)[0]
+		?.slice(0, 4096);
+	if (!raw) return isError ? "Tool failed." : undefined;
+	const escapeCode = String.fromCharCode(27);
+	const bell = String.fromCharCode(7);
+	const withoutSequences = raw
+		.replace(
+			new RegExp(
+				`${escapeCode}\\][^${bell}]*(?:${bell}|${escapeCode}\\\\|$)`,
+				"g",
+			),
+			"",
+		)
+		.replace(new RegExp(`${escapeCode}\\[[0-?]*[ -/]*[@-~]`, "g"), "");
+	const safe = Array.from(withoutSequences, (character) => {
+		const code = character.codePointAt(0) ?? 0;
+		return code < 32 || (code >= 127 && code <= 159) ? " " : character;
+	})
+		.join("")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (!safe) return isError ? "Tool failed." : undefined;
+	const emptyList = /^No (?:subagent|workflow) runs\.$/.test(safe);
+	if (!isError && !emptyList) return undefined;
+	return truncateToWidth(safe, FALLBACK_RESULT_WIDTH, "…");
+}
+
+function unavailableResult(
+	result: { content: Array<{ type: string; text?: string }> },
+	isError: boolean,
+	fallback: string,
+): Component {
+	return new Text(safeResultText(result, isError) ?? fallback, 0, 0);
+}
 
 class LiveRunComponent implements Component {
 	private run: RunRecord;
@@ -201,7 +245,12 @@ export function renderRunResult(
 ): Component {
 	const details = result.details as SubagentToolDetails | undefined;
 	const run = details?.run;
-	if (!run) return new Text("Subagent status unavailable.", 0, 0);
+	if (!run)
+		return unavailableResult(
+			result,
+			lifecycle.isError === true,
+			"Subagent status unavailable.",
+		);
 	const component =
 		lifecycle.lastComponent instanceof LiveRunComponent
 			? lifecycle.lastComponent
@@ -242,9 +291,15 @@ export function renderControlResult(
 	},
 	_options: { expanded: boolean; isPartial?: boolean },
 	theme: ExtensionContext["ui"]["theme"],
+	lifecycle: RunRenderLifecycle = {},
 ): Component {
 	const runs = (result.details as ControlToolDetails | undefined)?.runs;
-	if (!runs?.length) return new Text("Run status unavailable.", 0, 0);
+	if (!runs?.length)
+		return unavailableResult(
+			result,
+			lifecycle.isError === true,
+			"Run status unavailable.",
+		);
 	const firstRun = runs[0];
 	if (runs.length === 1 && firstRun) return compactRun(firstRun, theme, true);
 	const shown = runs.slice(0, 8);

@@ -262,23 +262,75 @@ test("POSIX cancellation escalates the entire child process group", {
 			resultMaxBytes: 1024,
 			transcriptMaxEvents: 20,
 		});
-		for (let attempt = 0; attempt < 100 && !fs.existsSync(pidFile); attempt++)
+		for (let attempt = 0; attempt < 300 && !fs.existsSync(pidFile); attempt++)
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		assert.equal(fs.existsSync(pidFile), true);
 		const descendantPid = Number(fs.readFileSync(pidFile, "utf8"));
+		const cancelledAt = Date.now();
 		controller.abort(new Error("test cancellation"));
 		const result = await pending;
 		assert.equal(result.state, "cancelled");
-		let alive = true;
-		for (let attempt = 0; attempt < 100 && alive; attempt++) {
-			try {
-				process.kill(descendantPid, 0);
-				await new Promise((resolve) => setTimeout(resolve, 10));
-			} catch {
-				alive = false;
-			}
-		}
-		assert.equal(alive, false, "descendant process should be reaped");
+		assert.ok(
+			Date.now() - cancelledAt < 2500,
+			"leader close should end the grace period before escalation",
+		);
+		assert.throws(
+			() => process.kill(descendantPid, 0),
+			"runCliAgent must not resolve while a descendant remains",
+		);
+	} finally {
+		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
+		else process.env.PI_SUBAGENTS_PI_BIN = previous;
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("POSIX cooperative cancellation does not wait out the grace period", {
+	skip: process.platform === "win32",
+}, async () => {
+	const directory = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-subagents-cooperative-exit-"),
+	);
+	const script = path.join(directory, "mock-pi.mjs");
+	const readyFile = path.join(directory, "ready");
+	fs.writeFileSync(
+		script,
+		`#!/usr/bin/env node\nimport fs from 'node:fs';fs.writeFileSync(${JSON.stringify(readyFile)},'ready');setInterval(()=>{},1000);\n`,
+	);
+	fs.chmodSync(script, 0o755);
+	const previous = process.env.PI_SUBAGENTS_PI_BIN;
+	process.env.PI_SUBAGENTS_PI_BIN = script;
+	try {
+		const definition = agent(script);
+		const controller = new AbortController();
+		const pending = runCliAgent({
+			runId: "agent_cooperative_exit",
+			runDirectory: directory,
+			request: {
+				agent: definition.name,
+				task: "test",
+				definition,
+				difficulty: 3,
+				background: false,
+				context: "fresh",
+				cwd: directory,
+				workspace: "shared",
+				timeoutMs: 10_000,
+				maxTurns: 3,
+				systemPrompt: "mock",
+			},
+			signal: controller.signal,
+			resultMaxBytes: 1024,
+			transcriptMaxEvents: 20,
+		});
+		for (let attempt = 0; attempt < 300 && !fs.existsSync(readyFile); attempt++)
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.equal(fs.existsSync(readyFile), true);
+		const cancelledAt = Date.now();
+		controller.abort(new Error("test cancellation"));
+		const result = await pending;
+		assert.equal(result.state, "cancelled");
+		assert.ok(Date.now() - cancelledAt < 2500);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
 		else process.env.PI_SUBAGENTS_PI_BIN = previous;
