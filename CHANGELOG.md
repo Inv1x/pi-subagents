@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.0
+
+### Minor Changes
+
+- Require Pi 0.87.1 and use canonical projected parent context and transcript-backed agent prompt sections. Classify PowerShell as mutating for writer leases and retry safety.
+
+  Add an isolated SDK child host with private canonical session checkpoints, stateful `subagent_control send`, per-invocation scheduler leases, worktree patch restoration, clean turn limits, bounded tool-free handoffs, compaction diagnostics, and complete child usage accounting. Preserve the explicit legacy CLI override, without stateful sends.
+
+  Add opt-in authenticated context summarization with accounted usage and append-only shortening of consumed completion notifications. Cover the migration with real session/projection tests and offline SDK subprocess integration tests.
+
+### Patch Changes
+
+- 4dd12dc: Keep child responses out of the main transcript, fix fleet navigation and retention, use all available models for routing, and harden child lifecycle, protocol validation, environment isolation, and run snapshots.
+- cd95e55: Adopt Changesets for version and changelog management.
+
 ## Unreleased
 
 ### Changed

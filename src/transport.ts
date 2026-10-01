@@ -220,7 +220,7 @@ function waitForProcessGroupGone(
 	});
 }
 
-async function terminateProcessTree(
+export async function terminateProcessTree(
 	processHandle: ChildProcess,
 	graceMs = 3000,
 ): Promise<void> {
@@ -313,7 +313,7 @@ export interface CliTransportOptions {
 	onEvent?: (event: TransportEvent) => void;
 }
 
-export async function runCliAgent(
+export async function runLegacyCliAgent(
 	options: CliTransportOptions,
 ): Promise<TransportResult> {
 	const { request } = options;
@@ -661,4 +661,14 @@ export async function runCliAgent(
 		transcript,
 		truncated: bounded.truncated,
 	};
+}
+
+/** Explicit CLI override preserves integrations; normal runs use the isolated SDK host. */
+export async function runCliAgent(
+	options: CliTransportOptions,
+): Promise<TransportResult> {
+	if (process.env.PI_SUBAGENTS_PI_BIN?.trim())
+		return runLegacyCliAgent(options);
+	const { runSdkAgent } = await import("./sdk-transport.ts");
+	return runSdkAgent(options);
 }

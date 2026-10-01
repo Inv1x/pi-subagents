@@ -270,6 +270,10 @@ export function resolveNamedSkillPaths(
 export function isWriteCapable(agent: AgentDefinition): boolean {
 	if (!agent.tools) return true;
 	return agent.tools.some(
-		(tool) => tool === "bash" || tool === "edit" || tool === "write",
+		(tool) =>
+			tool === "bash" ||
+			tool === "powershell" ||
+			tool === "edit" ||
+			tool === "write",
 	);
 }

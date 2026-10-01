@@ -12,6 +12,10 @@ import {
 	resolveNamedSkillPaths,
 } from "./agents.ts";
 import { loadConfig } from "./config.ts";
+import {
+	completionRetentionEdits,
+	summarizeContextWithModel,
+} from "./context-policy.ts";
 import { THINKING_LEVELS } from "./model-options.ts";
 import { openAgentModelSettings } from "./model-settings.ts";
 import { resolveAgentModelRoute } from "./routing.ts";
@@ -140,7 +144,7 @@ const ControlParams = Type.Object(
 		}),
 		message: Type.Union([Type.String(), Type.Null()], {
 			description:
-				"Message for send (stateful transport is not yet available), otherwise null",
+				"Follow-up task for send; starts a separately scheduled invocation in the same child session, otherwise null",
 		}),
 		timeoutMs: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()], {
 			description:
@@ -221,18 +225,17 @@ export function parentSummary(
 ): string {
 	const summaries: string[] = [];
 	const messages: string[] = [];
-	for (const entry of ctx.sessionManager.buildContextEntries()) {
-		if (entry.type === "compaction" && entry.summary) {
-			summaries.push(`[Compaction summary]\n${entry.summary}`);
-			continue;
+	for (const entry of ctx.sessionManager.buildSessionProjection().entries) {
+		for (const message of entry.messages) {
+			if (message.role === "compactionSummary") {
+				summaries.push(`[Compaction summary]\n${message.summary}`);
+			} else if (message.role === "branchSummary") {
+				summaries.push(`[Branch summary]\n${message.summary}`);
+			} else {
+				const text = textFromMessage(message);
+				if (text) messages.push(text);
+			}
 		}
-		if (entry.type === "branch_summary" && entry.summary) {
-			summaries.push(`[Branch summary]\n${entry.summary}`);
-			continue;
-		}
-		if (entry.type !== "message") continue;
-		const text = textFromMessage(entry.message);
-		if (text) messages.push(text);
 	}
 	const summaryText = summaries.join("\n\n");
 	const messageText = messages.slice(-20).join("\n\n");
@@ -376,6 +379,10 @@ function resolveRequest(
 		maxTurns,
 		maxRetries: params.maxRetries,
 		systemPrompt,
+		// Parent trust does not authorize another cwd's project settings.
+		projectTrusted:
+			ctx.isProjectTrusted() &&
+			path.resolve(ctx.cwd, params.cwd ?? ".") === path.resolve(ctx.cwd),
 		skillPaths: resolveNamedSkillPaths(
 			definition.skills,
 			ctx.cwd,
@@ -604,6 +611,16 @@ export default function (pi: ExtensionAPI) {
 			await Promise.all([workflowEngine.shutdown(), runtime.shutdown()]);
 	});
 
+	pi.on("turn_end", (event, ctx) => {
+		const edits = completionRetentionEdits(
+			event,
+			ctx,
+			BACKGROUND_COMPLETION_MESSAGE,
+			loadConfig(ctx.cwd, ctx.isProjectTrusted()).completionContextLimit,
+		);
+		if (edits.length) return { entries: [...event.entries, ...edits] };
+	});
+
 	pi.on("before_agent_start", (event, ctx) => {
 		reconcileBackgroundCompletions(ctx, runtime);
 		if (!pi.getActiveTools().includes("subagent_run")) return;
@@ -618,9 +635,7 @@ export default function (pi: ExtensionAPI) {
 		const catalog = agents
 			.map((agent) => `- ${agent.name}: ${agent.description}`)
 			.join("\n");
-		return {
-			systemPrompt: `${event.systemPrompt}\n\n<available_subagents>\nGive each subagent_run a concise descriptive agent name. To specialize it, set baseAgent to one of these exact definitions:\n${catalog || "- (none)"}\nIf baseAgent is omitted, an agent name matching a definition uses that definition; otherwise it uses general. Estimate difficulty for every child: 1 trivial, 2 light/focused, 3 standard, 4 complex or risky, 5 critical/high-uncertainty. Omit model and thinking unless the user explicitly requests overrides; configured profiles route by difficulty, then agent/parent defaults apply (${selectedModel(ctx) ?? "parent model"} currently selected). Omit maxTurns and timeoutMs unless the user requests hard ceilings; built-in defaults support long-running work.\n</available_subagents>`,
-		};
+		event.systemPromptOptions.sections.available_subagents = `<available_subagents>\nGive each subagent_run a concise descriptive agent name. To specialize it, set baseAgent to one of these exact definitions:\n${catalog || "- (none)"}\nIf baseAgent is omitted, an agent name matching a definition uses that definition; otherwise it uses general. Estimate difficulty for every child: 1 trivial, 2 light/focused, 3 standard, 4 complex or risky, 5 critical/high-uncertainty. Omit model and thinking unless the user explicitly requests overrides; configured profiles route by difficulty, then agent/parent defaults apply (${selectedModel(ctx) ?? "parent model"} currently selected). Omit maxTurns and timeoutMs unless the user requests hard ceilings; built-in defaults support long-running work.\n</available_subagents>`;
 	});
 
 	pi.registerTool({
@@ -726,6 +741,25 @@ export default function (pi: ExtensionAPI) {
 				pi.getThinkingLevel(),
 				config,
 			);
+			// Resolve trust, tools and model routing before making an optional paid call.
+			const summary =
+				config.summarizeContext && request.context === "summary"
+					? await summarizeContextWithModel(ctx, parentSummary(ctx), signal)
+					: undefined;
+			if (summary?.cancelled)
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Context summarization cancelled; no child run was started.",
+						},
+					],
+					details: {},
+					isError: true,
+					...(summary.usage ? { usage: summary.usage } : {}),
+				};
+			if (summary?.text)
+				request.task = `${params.task}\n\n<parent_context>\n${summary.text}\n</parent_context>`;
 			let activeRunId: string | undefined;
 			const unsubscribe = runtime.subscribe((update) => {
 				if (update.run.id !== activeRunId) return;
@@ -766,6 +800,20 @@ export default function (pi: ExtensionAPI) {
 						run: record,
 						recentActivity: runtime.getActivities(record.id),
 					} satisfies SubagentToolDetails,
+					...(summary?.usage ? { usage: summary.usage } : {}),
+				};
+			} catch (error) {
+				if (!summary?.usage) throw error;
+				return {
+					content: [
+						{
+							type: "text",
+							text: error instanceof Error ? error.message : String(error),
+						},
+					],
+					details: {},
+					isError: true,
+					usage: summary.usage,
 				};
 			} finally {
 				unsubscribe();
@@ -788,7 +836,7 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_control",
 		label: "Subagent Control",
 		description:
-			"List, inspect, wait for, interrupt, or stop subagent runs. Status is a one-shot inspection, not a polling loop. Stateful send is reserved for a future persistent transport.",
+			"List, inspect, wait for, interrupt, or stop subagent runs. Status is a one-shot inspection, not a polling loop. Send queues a new background invocation in the same canonical child session after reacquiring scheduler leases.",
 		parameters: ControlParams,
 		prepareArguments: (args) =>
 			prepareNullableFields<Static<typeof ControlParams>>(args, [
@@ -820,11 +868,50 @@ export default function (pi: ExtensionAPI) {
 					details: { runs },
 				};
 			}
-			if (params.action === "send")
-				throw new Error(
-					"subagent_control send requires the planned persistent RPC/SDK transport and is not available yet. Start a new child with selected context instead.",
-				);
 			const id = requireRunId(params.runId ?? undefined, params.action);
+			if (params.action === "send") {
+				const previous = runtime.getForSession(id, sessionId);
+				if (previous?.kind !== "agent") throw new Error(`Run not found: ${id}`);
+				const request = runtime.getContinuationRequest(
+					previous.id,
+					params.message ?? "",
+				);
+				if (
+					(request.definition.source === "project" || request.projectTrusted) &&
+					!ctx.isProjectTrusted()
+				)
+					throw new Error("Continuing this child requires a trusted project.");
+				canonicalModelSpec(ctx, request.model);
+				if (
+					request.definition.source === "project" &&
+					loadConfig(ctx.cwd, ctx.isProjectTrusted()).confirmProjectAgents
+				) {
+					if (
+						!ctx.hasUI ||
+						!(await ctx.ui.confirm(
+							"Continue project-local agent?",
+							request.definition.filePath,
+						))
+					)
+						throw new Error(
+							"Project-local agent continuation requires an interactive confirmation.",
+						);
+				}
+				const run = await runtime.startAgent(request, {
+					background: true,
+					sessionId,
+				});
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Queued follow-up [${run.id}] in child session ${run.metadata?.childSessionId}.`,
+						},
+					],
+					details: { runs: [run] },
+				};
+			}
+
 			if (params.action === "status") {
 				const run = runtime.getForSession(id, sessionId);
 				if (run?.kind !== "agent") throw new Error(`Run not found: ${id}`);

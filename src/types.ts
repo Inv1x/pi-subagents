@@ -144,6 +144,14 @@ export interface ResolvedAgentRunRequest extends AgentRunRequest {
 	timeoutMs: number;
 	maxTurns: number;
 	systemPrompt: string;
+	/** Pinned child lineage. Every invocation still goes through the scheduler. */
+	childSessionId?: string;
+	childSessionFile?: string;
+	continuationOf?: string;
+	/** Restore the preceding isolated workspace before resuming its conversation. */
+	restorePatch?: string;
+	worktreeBaseCommit?: string;
+	projectTrusted?: boolean;
 	/** Exact skill files explicitly passed to the child process. */
 	skillPaths?: string[];
 }
@@ -156,7 +164,8 @@ export interface TransportEvent {
 		| "retry"
 		| "settled"
 		| "stderr"
-		| "protocol_error";
+		| "protocol_error"
+		| "diagnostic";
 	data?: Record<string, unknown>;
 }
 
@@ -188,6 +197,10 @@ export interface ExtensionConfig {
 	transcriptMaxEvents: number;
 	retentionDays: number;
 	showStatus: boolean;
+	/** Opt-in additional model call for parent handoffs. */
+	summarizeContext: boolean;
+	/** Zero disables shortening; otherwise retain this many full completion messages. */
+	completionContextLimit: number;
 	confirmProjectAgents: boolean;
 	confirmProjectWorkflows: boolean;
 }

@@ -20,6 +20,7 @@ function captureExtension() {
 	>();
 	extension({
 		on: () => {},
+		getThinkingLevel: () => undefined,
 		registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
 		registerCommand: (name: string, command: unknown) =>
 			commands.set(
@@ -46,7 +47,7 @@ function headlessContext(
 		} as never,
 		sessionManager: {
 			getSessionId: () => "security-session",
-			buildContextEntries: () => [],
+			buildSessionProjection: () => ({ entries: [], messages: [] }),
 		} as never,
 		ui: {
 			notify: (message: string) => notifications.push(message),
@@ -65,6 +66,49 @@ function headlessContext(
 		getSystemPrompt: () => "",
 	} as ExtensionContext;
 }
+
+test("parent project trust is not granted to an overridden child cwd", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-trust-cwd-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = path.join(cwd, "user");
+	const runtime = getRuntime();
+	const startAgent = runtime.startAgent;
+	let trusted: boolean | undefined;
+	runtime.startAgent = async (request) => {
+		trusted = request.projectTrusted;
+		throw new Error("captured resolved request");
+	};
+	try {
+		const tool = captureExtension().tools.get("subagent_run");
+		assert.ok(tool);
+		for (const [directory, expected] of [
+			[".", true],
+			["other", false],
+		] as const) {
+			await assert.rejects(
+				tool.execute(
+					"trust-test",
+					{
+						agent: "reviewer",
+						task: "review",
+						cwd: directory,
+						agentScope: "user",
+					},
+					undefined,
+					undefined,
+					headlessContext(cwd, []),
+				),
+				/captured resolved request/,
+			);
+			assert.equal(trusted, expected);
+		}
+	} finally {
+		runtime.startAgent = startAgent;
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+});
 
 test("headless launches fail closed for project agents and workflow overrides", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-security-"));

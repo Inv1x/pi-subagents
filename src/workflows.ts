@@ -646,6 +646,10 @@ export class WorkflowEngine {
 					maxTurns,
 					timeoutMs,
 				}),
+				projectTrusted:
+					options.projectTrusted === true &&
+					path.resolve(options.cwd, spec.cwd ?? ".") ===
+						path.resolve(options.cwd),
 				skillPaths: resolveNamedSkillPaths(
 					definition.skills,
 					options.cwd,

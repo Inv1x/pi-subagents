@@ -646,6 +646,7 @@ test("fleet overlay takes initial focus without stealing it back", async () => {
 		hide: () => {},
 		setHidden: () => {},
 		isHidden: () => false,
+		getBounds: () => undefined,
 		focus: () => {
 			focused = true;
 			focusCalls++;
@@ -801,6 +802,7 @@ test("fleet arrows select agents while j/k exclusively scroll output", async () 
 		hide: () => {},
 		setHidden: () => {},
 		isHidden: () => false,
+		getBounds: () => undefined,
 		focus: () => {},
 		unfocus: () => {},
 		isFocused: () => true,

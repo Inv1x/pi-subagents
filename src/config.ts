@@ -25,6 +25,8 @@ export const DEFAULT_CONFIG: ExtensionConfig = {
 	transcriptMaxEvents: 500,
 	retentionDays: 30,
 	showStatus: true,
+	summarizeContext: false,
+	completionContextLimit: 0,
 	confirmProjectAgents: true,
 	confirmProjectWorkflows: true,
 };
@@ -276,6 +278,12 @@ export function loadConfig(
 			3650,
 		),
 		showStatus: resolveShowStatus(user, project),
+		summarizeContext: raw.summarizeContext === true,
+		completionContextLimit: nonNegativeInteger(
+			raw.completionContextLimit,
+			0,
+			1000,
+		),
 		confirmProjectAgents: raw.confirmProjectAgents !== false,
 		confirmProjectWorkflows: raw.confirmProjectWorkflows !== false,
 	};

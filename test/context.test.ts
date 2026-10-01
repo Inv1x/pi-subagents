@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	type ExtensionContext,
+	SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { canonicalModelSpec, parentSummary } from "../src/index.ts";
 
 function routingContext(options: {
@@ -47,40 +50,46 @@ test("model routing uses every available model and ignores scopes", () => {
 	);
 });
 
-test("summary context uses compacted entries and retains summaries and messages", () => {
-	let usedCompactionAwareEntries = false;
-	const ctx = {
-		sessionManager: {
-			buildContextEntries: () => {
-				usedCompactionAwareEntries = true;
-				return [
-					{ type: "compaction", summary: "Earlier decisions and files." },
-					{
-						type: "message",
-						message: { role: "user", content: "Retained user request." },
-					},
-					{ type: "branch_summary", summary: "Abandoned branch findings." },
-					{
-						type: "message",
-						message: {
-							role: "assistant",
-							content: [{ type: "text", text: "Retained assistant result." }],
-						},
-					},
-				];
-			},
-			getBranch: () => {
-				throw new Error("raw branch must not be used");
-			},
-		},
-	} as unknown as ExtensionContext;
+test("summary uses canonical restored projection and honors context edits and compaction", () => {
+	const manager = SessionManager.inMemory();
+	const old = manager.appendMessage({
+		role: "user",
+		content: "forgotten history",
+		timestamp: 1,
+	});
+	manager.appendCompaction("Earlier decisions and files.", null, 100);
+	const omitted = manager.appendMessage({
+		role: "user",
+		content: "abandoned failed attempt",
+		timestamp: 2,
+	});
+	const replaced = manager.appendMessage({
+		role: "user",
+		content: "original secret",
+		timestamp: 3,
+	});
+	manager.appendContextEdit(omitted, null);
+	manager.appendContextEdit(replaced, { content: "Retained replacement." });
+	const restored = SessionManager.inMemory(
+		process.cwd(),
+		{ id: manager.getSessionId() },
+		manager.getEntries(),
+	);
+	const ctx = { sessionManager: restored } as unknown as ExtensionContext;
 	const summary = parentSummary(ctx);
-	assert.equal(usedCompactionAwareEntries, true);
 	assert.match(
 		summary,
 		/\[Compaction summary\]\nEarlier decisions and files\./,
 	);
-	assert.match(summary, /user: Retained user request\./);
-	assert.match(summary, /\[Branch summary\]\nAbandoned branch findings\./);
-	assert.match(summary, /assistant: Retained assistant result\./);
+	assert.match(summary, /user: Retained replacement\./);
+	assert.doesNotMatch(summary, /forgotten|abandoned|original secret/);
+	assert.ok(restored.getEntry(old), "raw history remains intact");
+	assert.equal(parentSummary(ctx, 0), "");
+	assert.ok(parentSummary(ctx, 20).length <= 20);
+	restored.branch(replaced);
+	assert.match(
+		parentSummary(ctx),
+		/original secret/,
+		"branching before edits restores original context",
+	);
 });

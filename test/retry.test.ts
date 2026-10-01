@@ -85,35 +85,37 @@ test("runtime retries transient transport failures and preserves cumulative usag
 	}
 });
 
-test("runtime does not restart a child after a potentially mutating tool call", async () => {
-	const directory = fs.mkdtempSync(
-		path.join(os.tmpdir(), "pi-subagents-no-write-retry-"),
-	);
-	const counter = path.join(directory, "attempts.txt");
-	const script = path.join(directory, "mock-pi.mjs");
-	fs.writeFileSync(
-		script,
-		`#!/usr/bin/env node\nimport fs from 'node:fs';\nconst counter=${JSON.stringify(counter)};\nconst attempt=fs.existsSync(counter)?Number(fs.readFileSync(counter,'utf8'))+1:1;\nfs.writeFileSync(counter,String(attempt));\nconsole.log(JSON.stringify({type:'tool_execution_start',toolName:'write',args:{path:'changed.txt'}}));\nconsole.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[],usage:{input:1,output:1,cost:{total:0.01}},provider:'mock',model:'model',stopReason:'error',errorMessage:'WebSocket error',timestamp:Date.now()}}));\nconsole.log(JSON.stringify({type:'agent_settled'}));\n`,
-	);
-	fs.chmodSync(script, 0o755);
-	const previous = process.env.PI_SUBAGENTS_PI_BIN;
-	process.env.PI_SUBAGENTS_PI_BIN = script;
-	try {
-		const runtime = new SubagentRuntime(
-			new RunStore(path.join(directory, "runs")),
+for (const tool of ["bash", "powershell", "edit", "write"]) {
+	test(`runtime does not restart a child after ${tool}`, async () => {
+		const directory = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-subagents-no-write-retry-"),
 		);
-		runtime.configure({ ...DEFAULT_CONFIG, retryBaseDelayMs: 1 });
-		const completed = await runtime.startAgent(
-			request(definition(script, ["write"])),
-			{ background: false },
+		const counter = path.join(directory, "attempts.txt");
+		const script = path.join(directory, "mock-pi.mjs");
+		fs.writeFileSync(
+			script,
+			`#!/usr/bin/env node\nimport fs from 'node:fs';\nconst counter=${JSON.stringify(counter)};\nconst attempt=fs.existsSync(counter)?Number(fs.readFileSync(counter,'utf8'))+1:1;\nfs.writeFileSync(counter,String(attempt));\nconsole.log(JSON.stringify({type:'tool_execution_start',toolName:${JSON.stringify(tool)},args:{path:'changed.txt'}}));\nconsole.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[],usage:{input:1,output:1,cost:{total:0.01}},provider:'mock',model:'model',stopReason:'error',errorMessage:'WebSocket error',timestamp:Date.now()}}));\nconsole.log(JSON.stringify({type:'agent_settled'}));\n`,
 		);
-		assert.equal(completed.state, "failed");
-		assert.equal(completed.error?.message, "WebSocket error");
-		assert.equal(completed.metadata?.attempt, 1);
-		assert.equal(fs.readFileSync(counter, "utf8"), "1");
-	} finally {
-		if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
-		else process.env.PI_SUBAGENTS_PI_BIN = previous;
-		fs.rmSync(directory, { recursive: true, force: true });
-	}
-});
+		fs.chmodSync(script, 0o755);
+		const previous = process.env.PI_SUBAGENTS_PI_BIN;
+		process.env.PI_SUBAGENTS_PI_BIN = script;
+		try {
+			const runtime = new SubagentRuntime(
+				new RunStore(path.join(directory, "runs")),
+			);
+			runtime.configure({ ...DEFAULT_CONFIG, retryBaseDelayMs: 1 });
+			const completed = await runtime.startAgent(
+				request(definition(script, [tool])),
+				{ background: false },
+			);
+			assert.equal(completed.state, "failed");
+			assert.equal(completed.error?.message, "WebSocket error");
+			assert.equal(completed.metadata?.attempt, 1);
+			assert.equal(fs.readFileSync(counter, "utf8"), "1");
+		} finally {
+			if (previous === undefined) delete process.env.PI_SUBAGENTS_PI_BIN;
+			else process.env.PI_SUBAGENTS_PI_BIN = previous;
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
+	});
+}

@@ -1,6 +1,6 @@
 # pi-subagents
 
-Focused subagents and bounded programmatic workflows for [Pi](https://github.com/earendil-works/pi).
+Focused subagents and bounded programmatic workflows for [Pi](https://github.com/earendil-works/pi). Requires **Pi 0.87.1 or newer**; development dependencies pin 0.87.1.
 
 ## Features
 
@@ -8,7 +8,8 @@ Focused subagents and bounded programmatic workflows for [Pi](https://github.com
 - Natural parallelism: Pi can emit several sibling `subagent_run` calls in one assistant turn.
 - One global scheduler with foreground priority, concurrency limits, and shared-workspace writer leases.
 - Foreground and background runs with quiet transcript rows, live activity, usage, cancellation, timeout, and bounded artifacts.
-- Durable versioned run artifacts under `~/.pi/agent/subagents/runs/`.
+- Durable versioned run artifacts and canonical child sessions under `~/.pi/agent/subagents/runs/`.
+- Stateful follow-up tasks through `subagent_control send`, with scheduler leases reacquired for every invocation.
 - Programmatic TypeScript workflows with stable steps, dynamic fan-out, joins, and replay.
 - Worktree isolation with patch capture for write-capable children.
 - Session-scoped run status and a polished recent-run fleet inspector.
@@ -54,7 +55,7 @@ Both `subagent_run` and `workflow_run` accept `background: true`. A background l
 Use subagent_control to list runs and wait for the scout result.
 ```
 
-The extension adds concise tool-specific system-prompt guidance that encourages proactive delegation, explains foreground versus background launches, and reminds the parent about lifecycle and write-safety constraints.
+The extension adds concise tool-specific system-prompt guidance in a named, transcript-backed prompt section. It encourages proactive delegation, explains foreground versus background launches, and reminds the parent about lifecycle and write-safety constraints. Parent summary context uses Pi's canonical projection, honoring context-edit omissions/replacements and compaction rather than reviving discarded attempts.
 
 ## Programmatic workflows
 
@@ -161,13 +162,13 @@ Model and thinking fields resolve independently in this order:
 3. Agent frontmatter (`model`, `thinking`)
 4. The parent Pi session's current model and thinking level
 
-With no configured ladder, behavior remains the same as before. `model: inherit` follows the live parent selection. The extension passes resolved values through Pi's `--model` and `--thinking` flags, then records the difficulty, requested model/effort, and actual provider/model reported by the child in durable run status.
+With no configured ladder, behavior remains the same as before. `model: inherit` follows the live parent selection. The extension passes resolved values to the isolated Pi SDK session, then records the difficulty, requested model/effort, and actual provider/model reported by the child in durable run status.
 
 Compact run rows show the selected model and effort for that individual run without rendering child response bodies, including when Pi expands a tool row. Full results remain model-visible in tool/custom-message content and available in `/subagents-fleet` and durable artifacts. The fleet status intentionally omits a single model because concurrent children can use different configurations.
 
-The child transport passes the canonical model through `--model` and the clamped effort through `--thinking`. Explicit models, bare model resolution, profile settings, doctor diagnostics, and workflow routing resolve against every model in `modelRegistry.getAvailable()`; `ctx.scopedModels` and old persisted workflow `scopedModels` fields are ignored. Run metadata records the requested model/effort and the model reported by Pi; a reported selected-model mismatch fails the run instead of silently falling back. Concrete upstream `responseModel` values are retained when providers expose them.
+The SDK child receives the canonical model and clamped thinking effort. Explicit models, bare model resolution, profile settings, doctor diagnostics, and workflow routing resolve against every model in `modelRegistry.getAvailable()`; `ctx.scopedModels` and old persisted workflow `scopedModels` fields are ignored. Run metadata records the requested model/effort and the model reported by Pi; a reported selected-model mismatch fails the run instead of silently falling back. Concrete upstream `responseModel` values are retained when providers expose them.
 
-Children run with `--no-session` because this package owns their durable artifacts. Session-file-only usage trackers therefore see the parent session but not child requests; use the per-run status files or fleet totals for authoritative child usage.
+Each invocation runs in a separate Node.js SDK host process. Its canonical session entries are atomically checkpointed to a private `session.json` artifact and restored through `SessionManager.inMemory()` on the next invocation. No idle child process or writer lease is retained between invocations. These are package-owned checkpoints, not Pi's ordinary session-directory JSONL files; use per-run status or fleet totals for child usage, including compaction and standalone cache-warming usage. Idle cache warming is disabled for unscheduled children without modifying user settings; normal streaming warming remains available.
 
 ## Tools
 
@@ -192,13 +193,17 @@ Important options:
 - `timeoutMs`, `maxTurns`, `maxRetries`
 - `agentScope: user | project | both` (defaults to `both` in trusted projects, otherwise `user`)
 
-Usually omit `timeoutMs` and `maxTurns`. Built-in agents default to one hour and 128 assistant turns; explicit values are hard safety ceilings, and low ad hoc caps can terminate broad work before it returns a useful handoff.
+Usually omit `timeoutMs` and `maxTurns`. Built-in agents default to one hour and 128 assistant turns. Pi's `finishTurn` enforces the turn ceiling after completed tools. When budget remains, a bounded, tool-free final-handoff continuation is requested before settlement; it never exceeds the ceiling or continues an aborted/error response. Low ad hoc caps can still end work without a final handoff.
 
 ### `subagent_control`
 
-Actions: `list`, `status`, `wait`, `interrupt`, `stop`.
+Actions: `list`, `status`, `wait`, `interrupt`, `stop`, `send`.
 
-`send` is reserved for the future persistent RPC/SDK child transport and currently returns an explicit unsupported error.
+`send` takes a settled child run ID and a nonblank `message`. It starts a **new background run ID** in the same child-session lineage, preserving conversation history and pinned model/tool configuration. Use the returned ID for status, waiting, further sends, or cancellation. The invocation reacquires the global scheduler and workspace-writer lease; concurrent sends from an already-continued or still-active invocation are rejected. Project trust and project-agent confirmation are rechecked.
+
+Worktree follow-ups reconstruct the preceding cumulative patch in a new isolated worktree; the source must remain clean and at the same HEAD. A failed patch capture or changed base fails closed. After interruption, unresolved tools are marked as having uncertain side effects before resuming; inspect workspace state instead of blindly repeating them. Checkpoints survive reloads and process restarts until artifact retention removes them.
+
+For integrations that explicitly set `PI_SUBAGENTS_PI_BIN`, the previous one-shot JSON CLI transport remains available. That override does not support stateful `send`.
 
 ### `workflow_run`
 
@@ -223,7 +228,7 @@ Actions: `list`, `status`, `wait`, `stop`, `resume`.
 
 User configuration: `~/.pi/agent/pi-subagents.json`
 
-Trusted project override: `.pi/pi-subagents.json`
+Trusted project override: `.pi/pi-subagents.json`. Overriding a child's source `cwd` does not transfer the parent's trust to that directory's Pi settings.
 
 ```json
 {
@@ -261,10 +266,16 @@ Trusted project override: `.pi/pi-subagents.json`
   "transcriptMaxEvents": 500,
   "retentionDays": 30,
   "showStatus": true,
+  "summarizeContext": false,
+  "completionContextLimit": 0,
   "confirmProjectAgents": true,
   "confirmProjectWorkflows": true
 }
 ```
+
+`summarizeContext: true` enables one additional authenticated `modelRegistry.streamSimple()` call for a standalone `subagent_run` using summary context. It uses the parent's model, respects cancellation, caps output at 1024 tokens, and reports its usage on the tool result. It is off by default to avoid unexpected paid calls; unusable summary responses fall back to the canonical text excerpt.
+
+`completionContextLimit: N` (positive integer) keeps the newest N full background completion notifications in future model context. Older, already-consumed notifications with an existing output artifact are replaced with a concise artifact pointer using append-only context edits. Raw history and accounting remain intact. The default `0` disables this policy; artifacts still follow `retentionDays`.
 
 Project TypeScript workflow confirmation is mandatory and cannot be disabled; `confirmProjectWorkflows` additionally controls previews for non-project `/workflow-run` command launches.
 
@@ -272,7 +283,7 @@ Agent profile keys use the resolved agent definition name, not a descriptive run
 
 ## Write safety and worktrees
 
-An agent with `bash`, `edit`, or `write` is conservatively write-capable.
+An agent with `bash`, `powershell`, `edit`, or `write` is conservatively write-capable.
 
 - Read-only children may run concurrently in a shared workspace.
 - Shared-workspace writers are serialized by a workspace lease.
@@ -292,16 +303,18 @@ Each run has a private directory:
 ├── events.jsonl
 ├── workflow.json          # workflows only
 ├── system-prompt.md       # child runs
+├── request.json           # pinned child configuration
+├── session.json           # canonical child checkpoint (SDK transport)
 ├── output.md
 ├── transcript.log
 └── changes.patch          # worktree changes, when present
 ```
 
-Model-visible output is capped; full output remains in `output.md`. JSON event lines and stderr are independently bounded.
+Model-visible output is capped; full output remains in `output.md`. SDK control/events travel over a dedicated IPC channel rather than tool-visible stdout; stderr and activity history are bounded. The legacy JSON transport also bounds each event line.
 
-Pi 0.84 assistant deltas are intentionally ignored so child response bodies never stream into the parent transcript; the final `message_end` remains authoritative and is runtime-validated. A zero-exit child still fails if it does not produce a valid final assistant result followed by `agent_settled`.
+Assistant deltas are intentionally ignored so child response bodies never stream into the parent transcript; the final `message_end` remains authoritative. A zero-exit child still fails if it does not produce a valid final assistant result followed by `agent_settled`.
 
-After Pi exhausts its own provider-level retries, the extension retries a child process for recognized transient failures such as WebSocket disconnects, connection resets, rate limits, and 5xx responses. Retries use bounded exponential backoff, preserve cumulative usage/cost and attempt history, and stay within the original run timeout. To avoid repeating side effects, the extension does not restart a child after it has invoked `bash`, `edit`, or `write`. Set `maxRetries` to `0` globally or per run to disable process-level retries.
+After Pi exhausts its own provider-level retries, the extension retries a child process for recognized transient failures such as WebSocket disconnects, connection resets, rate limits, and 5xx responses. Retries use bounded exponential backoff, preserve cumulative usage/cost and attempt history, and stay within the original run timeout. To avoid repeating side effects, the extension does not restart a child after it has invoked `bash`, `powershell`, `edit`, or `write`. SDK retries restore the pre-invocation checkpoint while retaining cumulative billed usage. Set `maxRetries` to `0` globally or per run to disable process-level retries.
 
 The current session's active fleet is summarized in one compact status line. Workflow children are represented by their workflow rather than counted as standalone agents. Finished standalone runs and complete workflow families remain visible for exactly five minutes from their `endedAt` timestamps; later metadata updates do not extend the window. Open the fleet inspector with `/subagents-fleet`; with `pi-ui-customization` loaded, editor footer navigation can select the status and `Enter` opens it. The extension opts this status into preserving its accent color during selection, so terminal inversion uses that color as the selected background. That navigation is owned by the editor only, so selectors and overlays keep normal ownership of their keys. The inspector groups workflow children beneath their parent, uses state-colored markers, and shows task, final result/error, model/usage, and output/transcript/patch artifact paths in a scrollable details panel. Difficulty is intentionally omitted. Use `Up`/`Down` to select runs, `g`/`G` to jump, `j`/`k` to scroll the selected details without changing selection, `b` to background an eligible run, `r` to refresh, and `Esc`, `Ctrl+C`, or `q` to close. Literal shortcuts support Kitty keyboard sequences. Set `showStatus` to `false` to hide the summary; the former `showWidget: false` setting is still honored for compatibility.
 
@@ -332,7 +345,7 @@ npm pack --dry-run
 pi -e . --list-models
 ```
 
-Tests cover protocol framing and limits, scheduler concurrency/resource leases, trust-aware discovery, child JSON event parsing, compact UI rendering, status projection, and workflow fan-out/persistence.
+Tests cover protocol framing and limits, scheduler concurrency/resource leases, trust-aware discovery, canonical projection and restoration, legacy JSON parsing, real SDK subprocesses against an offline local provider, stateful sends, worktree restoration, hard turn limits, final handoffs, cancellation, context-retention/accounting policies, compact UI rendering, status projection, and workflow fan-out/persistence.
 
 ## Versioning
 

@@ -209,6 +209,68 @@ export class SubagentRuntime {
 		return [...(this.activities.get(runIdValue) ?? [])];
 	}
 
+	getContinuationRequest(id: string, message: string): ResolvedAgentRunRequest {
+		const previous = this.getInternal(id);
+		if (previous?.kind !== "agent") throw new Error(`Run not found: ${id}`);
+		if (!message.trim())
+			throw new Error("send requires a nonblank follow-up message.");
+		if (
+			!TERMINAL_STATES.has(previous.state) ||
+			this.completions.has(previous.id)
+		)
+			throw new Error(
+				"Wait for the child invocation to settle before sending a follow-up.",
+			);
+		if (process.env.PI_SUBAGENTS_PI_BIN?.trim())
+			throw new Error(
+				"Persistent send requires the SDK transport, not PI_SUBAGENTS_PI_BIN.",
+			);
+		const lineage = previous.metadata?.childSessionId;
+		if (typeof lineage !== "string")
+			throw new Error("This run predates persistent child sessions.");
+		this.loadPersisted(Number.MAX_SAFE_INTEGER);
+		if (
+			[...this.records.values()].some(
+				(record) => record.metadata?.continuationOf === previous.id,
+			)
+		)
+			throw new Error(
+				"This invocation already has a follow-up; send to the latest child invocation instead.",
+			);
+		const file = path.join(this.store.runDir(previous.id), "session.json");
+		if (!fs.existsSync(file))
+			throw new Error(
+				"The child has no canonical session checkpoint to continue.",
+			);
+		const request = JSON.parse(
+			fs.readFileSync(
+				path.join(this.store.runDir(previous.id), "request.json"),
+				"utf8",
+			),
+		) as ResolvedAgentRunRequest;
+		if (
+			previous.workspace === "worktree" &&
+			(typeof previous.metadata?.worktreeSummary !== "string" ||
+				String(previous.metadata.worktreeSummary).startsWith(
+					"Could not capture",
+				))
+		)
+			throw new Error("Cannot restore a worktree whose patch capture failed.");
+		return {
+			...request,
+			task: message.trim(),
+			background: true,
+			childSessionId: lineage,
+			childSessionFile: file,
+			continuationOf: previous.id,
+			restorePatch: previous.patchArtifact,
+			worktreeBaseCommit:
+				typeof previous.metadata?.worktreeBaseCommit === "string"
+					? previous.metadata.worktreeBaseCommit
+					: undefined,
+		};
+	}
+
 	createWorkflowRecord(
 		workflow: string,
 		input: unknown,
@@ -274,6 +336,24 @@ export class SubagentRuntime {
 		options: StartAgentOptions,
 	): Promise<RunRecord> {
 		const id = runId("agent");
+		if (request.continuationOf) {
+			const canonical = this.getContinuationRequest(
+				request.continuationOf,
+				request.task,
+			);
+			if (
+				this.getInternal(request.continuationOf)?.sessionId !==
+				options.sessionId
+			)
+				throw new Error("Child session belongs to another parent session.");
+			request = canonical;
+		}
+		const previousCheckpoint = request.childSessionFile;
+		request = {
+			...request,
+			childSessionId: request.childSessionId ?? id,
+			childSessionFile: path.join(this.store.runDir(id), "session.json"),
+		};
 		const createdAt = now();
 		const record: RunRecord = {
 			version: 1,
@@ -316,6 +396,10 @@ export class SubagentRuntime {
 				timeoutMs: request.timeoutMs,
 				writeCapable: isWriteCapable(request.definition),
 				ownerPid: process.pid,
+				childSessionId: request.childSessionId,
+				...(request.continuationOf
+					? { continuationOf: request.continuationOf }
+					: {}),
 				...(options.background
 					? { completionPending: true, completionGeneration: 1 }
 					: {}),
@@ -323,6 +407,15 @@ export class SubagentRuntime {
 		};
 		this.records.set(id, record);
 		this.store.create(record);
+		this.store.writeText(id, "request.json", JSON.stringify(request));
+		this.store.writeText(id, "system-prompt.md", request.systemPrompt);
+		if (previousCheckpoint && request.continuationOf) {
+			this.store.writeText(
+				id,
+				"session.json",
+				fs.readFileSync(previousCheckpoint, "utf8"),
+			);
+		}
 		this.activities.set(id, []);
 		options.onCreated?.(snapshotRunRecord(record));
 		const completion = deferred<RunRecord>();
@@ -341,10 +434,12 @@ export class SubagentRuntime {
 		if (options.signal?.aborted) parentAbort();
 		else options.signal?.addEventListener("abort", parentAbort, { once: true });
 		this.controllers.set(id, controller);
-		const resources =
-			request.workspace === "shared" && isWriteCapable(request.definition)
+		const resources = [
+			`child-session:${request.childSessionId}`,
+			...(request.workspace === "shared" && isWriteCapable(request.definition)
 				? [`workspace-write:${normalizeResourcePath(request.cwd)}`]
-				: [];
+				: []),
+		];
 
 		const execution = this.scheduler
 			.run(() => this.executeAgent(record, request, controller), {
@@ -543,6 +638,31 @@ export class SubagentRuntime {
 		try {
 			if (request.workspace === "worktree") {
 				worktree = createWorktree(request.cwd, record.id);
+				if (
+					request.worktreeBaseCommit &&
+					request.worktreeBaseCommit !== worktree.baseCommit
+				)
+					throw new Error(
+						"Source HEAD changed since the child worktree was captured; apply its patch and start a new child.",
+					);
+				if (request.restorePatch) {
+					const restored = spawnSync(
+						"git",
+						[
+							"-C",
+							worktree.path,
+							"apply",
+							"--index",
+							"--",
+							request.restorePatch,
+						],
+						{ encoding: "utf8", windowsHide: true },
+					);
+					if (restored.status !== 0)
+						throw new Error(
+							`Cannot restore child worktree: ${restored.stderr}`,
+						);
+				}
 				request = { ...request, cwd: worktree.cwd };
 				this.patch(record, {
 					cwd: request.cwd,
@@ -550,6 +670,7 @@ export class SubagentRuntime {
 						...record.metadata,
 						worktreePath: worktree.path,
 						worktreeBranch: worktree.branch,
+						worktreeBaseCommit: worktree.baseCommit,
 						sourceCwd: originalRequest.cwd,
 					},
 				});
@@ -566,8 +687,20 @@ export class SubagentRuntime {
 			let combinedStderr = "";
 			let unsafeToolSeen = false;
 			let finalResult: TransportResult | undefined;
+			const checkpointBefore =
+				request.childSessionFile && fs.existsSync(request.childSessionFile)
+					? fs.readFileSync(request.childSessionFile, "utf8")
+					: undefined;
 
 			for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+				if (attempt > 1 && request.childSessionFile) {
+					if (checkpointBefore === undefined)
+						fs.rmSync(request.childSessionFile, { force: true });
+					else
+						fs.writeFileSync(request.childSessionFile, checkpointBefore, {
+							mode: 0o600,
+						});
+				}
 				const remainingMs = Math.max(1, deadline - now());
 				this.patch(record, {
 					error: undefined,
@@ -586,6 +719,7 @@ export class SubagentRuntime {
 						if (
 							event.type === "activity" &&
 							(event.data?.tool === "bash" ||
+								event.data?.tool === "powershell" ||
 								event.data?.tool === "edit" ||
 								event.data?.tool === "write")
 						)
@@ -671,6 +805,21 @@ export class SubagentRuntime {
 	): void {
 		if (event.type === "started" && typeof event.data?.pid === "number") {
 			this.patch(record, { pid: event.data.pid });
+			return;
+		}
+		if (event.type === "diagnostic") {
+			this.store.appendEvent(
+				record.id,
+				"run.diagnostic",
+				record.state,
+				event.data,
+			);
+			this.patch(record, {
+				activity: {
+					message: String(event.data?.message ?? "Child diagnostic"),
+					updatedAt: now(),
+				},
+			});
 			return;
 		}
 		if (event.type === "activity") {
