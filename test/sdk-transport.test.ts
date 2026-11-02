@@ -383,6 +383,40 @@ test("worktree continuation restores its cumulative patch without touching the s
 	}
 });
 
+test("SDK startup failure exposes the missing Node executable and recovery guidance instead of EPIPE", async () => {
+	const app = await fixture(() => ({ text: "must not be called" }));
+	const descriptor = Object.getOwnPropertyDescriptor(process, "execPath");
+	assert.ok(descriptor);
+	const missingNode = path.join(
+		app.directory,
+		"removed-node",
+		path.basename(process.execPath),
+	);
+	try {
+		// A long-lived Pi process retains this path after a Homebrew Node upgrade.
+		Object.defineProperty(process, "execPath", {
+			...descriptor,
+			value: missingNode,
+		});
+		const result = await app.runtime.startAgent(app.request, {
+			background: false,
+			sessionId: "parent",
+		});
+		assert.equal(result.state, "failed");
+		assert.match(result.error?.message ?? "", /ENOENT/);
+		assert.ok(result.error?.message.includes(missingNode));
+		assert.match(result.error?.message ?? "", /restart Pi/i);
+		assert.doesNotMatch(result.error?.message ?? "", /EPIPE/);
+		assert.equal(result.output, result.error?.message);
+		assert.equal(app.requests.length, 0);
+		const persisted = app.runtime.store.read(result.id);
+		assert.equal(persisted?.error?.message, result.error?.message);
+	} finally {
+		Object.defineProperty(process, "execPath", descriptor);
+		await app.dispose();
+	}
+});
+
 test("SDK transport cancellation and timeout reap the process without a success result", async () => {
 	const app = await fixture(() => ({ hang: true }));
 	try {

@@ -92,8 +92,15 @@ export async function runSdkAgent(
 	const closed = new Promise<void>((resolve) => {
 		child.once("close", () => resolve());
 	});
-	child.on("error", (error) => {
-		hostError = error.message;
+	child.on("error", (error: NodeJS.ErrnoException) => {
+		hostError ??=
+			child.pid === undefined
+				? `Could not start SDK child with Node.js executable "${executable}": ${error.message}${
+						error.code === "ENOENT"
+							? "\nIf Node.js was upgraded or removed while Pi was running, restart Pi to use the current executable. Otherwise, check that the executable and child working directory exist."
+							: ""
+					}`
+				: error.message;
 	});
 	// A dead leader can leave descendants holding stdout open; don't wait for
 	// the run timeout before reaping that process group and reaching close.
@@ -126,26 +133,30 @@ export async function runSdkAgent(
 	const timeout = setTimeout(() => abort("timed_out"), request.timeoutMs);
 	signal.addEventListener("abort", onAbort, { once: true });
 	if (signal.aborted) onAbort();
-	options.onEvent?.({ type: "started", data: { pid: child.pid } });
-	child.send(
-		{
-			type: "invoke",
-			input: {
-				request,
-				sessionFile:
-					request.childSessionFile ??
-					path.join(options.runDirectory, "session.json"),
-				resultMaxBytes: options.resultMaxBytes,
-				transcriptMaxEvents: options.transcriptMaxEvents,
+	// Sending before spawn succeeds can mask ENOENT/EACCES with write EPIPE.
+	child.once("spawn", () => {
+		options.onEvent?.({ type: "started", data: { pid: child.pid } });
+		if (reason) return;
+		child.send(
+			{
+				type: "invoke",
+				input: {
+					request,
+					sessionFile:
+						request.childSessionFile ??
+						path.join(options.runDirectory, "session.json"),
+					resultMaxBytes: options.resultMaxBytes,
+					transcriptMaxEvents: options.transcriptMaxEvents,
+				},
 			},
-		},
-		(error) => {
-			if (error) {
-				hostError = error.message;
-				terminate();
-			}
-		},
-	);
+			(error) => {
+				if (error) {
+					hostError ??= error.message;
+					terminate();
+				}
+			},
+		);
+	});
 	try {
 		await closed;
 	} finally {

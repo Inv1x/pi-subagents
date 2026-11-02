@@ -125,6 +125,37 @@ test("launch and control renderers stay compact", () => {
 	assert.doesNotMatch(expanded, /# Plan|focused work|runId|Ctrl\+O/);
 });
 
+test("failed run cards show the startup cause, executable, and recovery guidance", () => {
+	const failed = run({
+		state: "failed",
+		error: {
+			code: "failed",
+			message:
+				'Could not start SDK child with Node.js executable "/removed/node": spawn /removed/node ENOENT\nIf Node.js was upgraded or removed while Pi was running, restart Pi to use the current executable.',
+			retryable: false,
+		},
+	});
+	for (const expanded of [false, true]) {
+		for (const component of [
+			renderRunResult(
+				{ content: [], details: { run: failed } },
+				{ expanded },
+				theme,
+			),
+			renderControlResult(
+				{ content: [], details: { runs: [failed] } },
+				{ expanded },
+				theme,
+			),
+		]) {
+			const rendered = component.render(100).join("\n");
+			assert.match(rendered, /ENOENT/);
+			assert.match(rendered, /\/removed\/node/);
+			assert.match(rendered, /restart Pi/);
+		}
+	}
+});
+
 test("quiet renderers show safe actionable errors and empty lists without child bodies", () => {
 	for (const message of [
 		"Unknown child model 'missing/model'. Use an exact available provider/model identifier.",
