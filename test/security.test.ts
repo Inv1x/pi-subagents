@@ -6,7 +6,7 @@ import test from "node:test";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
-	ExtensionContext,
+	ExtensionToolContext,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import extension from "../src/index.ts";
@@ -34,7 +34,7 @@ function captureExtension() {
 function headlessContext(
 	cwd: string,
 	notifications: string[],
-): ExtensionContext {
+): ExtensionToolContext {
 	return {
 		cwd,
 		mode: "json",
@@ -58,13 +58,17 @@ function headlessContext(
 		isProjectTrusted: () => true,
 		isIdle: () => true,
 		signal: undefined,
+		tools: [],
+		executeTool: async () => {
+			throw new Error("Nested tool calls are not expected in this harness");
+		},
 		abort: () => {},
 		hasPendingMessages: () => false,
 		shutdown: () => {},
 		getContextUsage: () => undefined,
 		compact: () => {},
 		getSystemPrompt: () => "",
-	} as ExtensionContext;
+	} as ExtensionToolContext;
 }
 
 test("parent project trust is not granted to an overridden child cwd", async () => {
@@ -229,7 +233,20 @@ test("headless launches fail closed for project agents and workflow overrides", 
 
 		const command = commands.get("workflow-run");
 		assert.ok(command);
-		await command.handler("user-review review", ctx as ExtensionCommandContext);
+		const unsupported = () => {
+			throw new Error("Session operations must not run before confirmation");
+		};
+		const commandContext: ExtensionCommandContext = {
+			...ctx,
+			getSystemPromptOptions: unsupported,
+			waitForIdle: unsupported,
+			newSession: unsupported,
+			fork: unsupported,
+			navigateTree: unsupported,
+			switchSession: unsupported,
+			reload: unsupported,
+		};
+		await command.handler("user-review review", commandContext);
 		assert.match(notifications.at(-1) ?? "", /interactive launch confirmation/);
 		assert.equal(fs.existsSync(marker), false);
 	} finally {

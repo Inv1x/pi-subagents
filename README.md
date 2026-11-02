@@ -1,6 +1,6 @@
 # pi-subagents
 
-Focused subagents and bounded programmatic workflows for [Pi](https://github.com/earendil-works/pi). Requires **Pi 0.87.1 or newer**; development dependencies pin 0.87.1.
+Focused subagents and bounded programmatic workflows for [Pi](https://github.com/earendil-works/pi). Requires **Pi 1.4.0 or newer**; development dependencies and the lockfile pin 1.4.0. See [Pi compatibility](docs/pi-compatibility.md) for the version-floor rationale and upgrade opportunities.
 
 ## Features
 

@@ -19,6 +19,8 @@ jobs:
           node-version: 22.19.0
           cache: npm
       - run: npm ci
+      - name: Verify the Pi 1.4.0 dependency tree
+        run: npm ls @earendil-works/pi-coding-agent @earendil-works/pi-ai @earendil-works/pi-agent-core @earendil-works/pi-tui
       - run: npm run release:status -- --since origin/main
       - run: npm run check
       - run: npm run typecheck
